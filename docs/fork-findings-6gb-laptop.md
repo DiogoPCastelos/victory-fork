@@ -267,6 +267,7 @@ Considered and not taken:
 | `VICTORY_TEXTURE_SPILL` | on | textures picked by index may go on into shared memory |
 | `VICTORY_COMPUTE_WAIT` | on | a dispatch waits for its pipeline |
 | `VICTORY_PIPELINE_COMMIT_MB` | 2048 | pipeline workers wait below this much free commit |
+| `VICTORY_SHADER_CACHE_FAILURES` | on | a translation that fails is kept in the shader cache under its key, so later runs and `--warm` do not translate it again |
 
 ## Next
 

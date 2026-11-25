@@ -8,6 +8,14 @@
 //! The entry is our own encoding of [`HostShader`]: a field added to it
 //! must be added to `encode` and `decode` too (entries of older builds
 //! are ignored anyway).
+//!
+//! A translation that fails is kept too ([`FAILED`] and the error), under
+//! the same key: the translator is a function of that key, so it would fail
+//! the same way again. Each run used to translate again every container that
+//! does not translate (254 of the title's pack on a 32-lane GPU), some of
+//! them twice (the first-half retry), at creation and in `--warm`; a changed
+//! translator gets a new key and tries them afresh.
+//! `VICTORY_SHADER_CACHE_FAILURES=0`: failures are not kept, as before.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -21,6 +29,12 @@ use victory_shader::{HwStage, RootType};
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// Whether failed translations are kept ([`FAILED`]). On by default.
+fn keep_failures() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_CACHE_FAILURES").is_none_or(|v| v != "0"))
+}
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
@@ -51,7 +65,12 @@ fn build() -> [u8; 32] {
     static WARNED: std::sync::Once = std::sync::Once::new();
     let limit = victory_shader::emit::loop_limit();
     if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
-        WARNED.call_once(|| tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"));
+        WARNED.call_once(|| {
+            tracing::warn!(
+                limit,
+                "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
+            )
+        });
     }
     static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
     let exe = EXE.get_or_init(|| {
@@ -88,7 +107,8 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
         ran.store(true, Ordering::Relaxed);
         victory_shader::emit::translate(c).map_err(|e| e.to_string())
     };
-    cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
+    cached(cache, &build(), container, keep_failures(), translate)
+        .map(|_| ran.load(Ordering::Relaxed))
 }
 
 /// The translation of a console shader container, from the cache when
@@ -96,7 +116,7 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate),
+        Some(cache) => cached(cache, &build(), container, keep_failures(), translate),
         None => translate(container),
     }
 }
@@ -106,6 +126,7 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
+    keep_failures: bool,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
@@ -118,8 +139,11 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader))
+        match (self.translate)(&input[32..]) {
+            Ok(shader) => Ok(encode(&shader)),
+            Err(e) if self.keep_failures => Ok([FAILED.as_slice(), e.as_bytes()].concat()),
+            Err(e) => Err(anyhow::Error::msg(e)),
+        }
     }
 }
 
@@ -127,26 +151,35 @@ fn cached(
     cache: &Cache,
     build: &[u8; 32],
     container: &[u8],
+    keep_failures: bool,
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
+        keep_failures,
     };
     for _ in 0..2 {
         let path = cache
             .get_or_convert(&converter, &input)
             .map_err(|e| format!("{e:#}"))?;
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+        let entry = match std::fs::read(&path).ok() {
+            Some(b) if b.starts_with(FAILED) => {
+                Some(Err(String::from_utf8_lossy(&b[FAILED.len()..]).into_owned()))
+            }
+            Some(b) => decode(&b).map(Ok),
+            None => None,
+        };
+        if let Some(entry) = entry {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
             } else {
                 (&HITS, "from the cache")
             };
             counter.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(path = %path.display(), "shader {what}");
-            return Ok(shader);
+            tracing::debug!(path = %path.display(), failed = entry.is_err(), "shader {what}");
+            return entry;
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
@@ -156,6 +189,8 @@ fn cached(
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";
+/// A kept failure: these four bytes, then the translator's error in UTF-8.
+const FAILED: &[u8; 4] = b"VSHF";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -372,26 +407,71 @@ mod tests {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(shader())
         };
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(
+            cached(&cache, &build, container, false, translate),
+            Ok(shader())
+        );
+        assert_eq!(
+            cached(&cache, &build, container, false, translate),
+            Ok(shader())
+        );
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
         // Another build translates again.
-        assert_eq!(cached(&cache, &[8; 32], container, translate), Ok(shader()));
+        assert_eq!(
+            cached(&cache, &[8; 32], container, false, translate),
+            Ok(shader())
+        );
         assert_eq!(runs.load(Ordering::Relaxed), 2);
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
             std::fs::write(e, b"VSH1 broken").unwrap();
         }
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(
+            cached(&cache, &build, container, false, translate),
+            Ok(shader())
+        );
         assert_eq!(runs.load(Ordering::Relaxed), 3);
-        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(
+            cached(&cache, &build, container, false, translate),
+            Ok(shader())
+        );
         assert_eq!(runs.load(Ordering::Relaxed), 3);
 
-        // Failures are not stored.
-        let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
-        assert!(cached(&cache, &build, b"other", fail).is_err());
+        // Failures are not stored unless asked.
+        let fails = AtomicU64::new(0);
+        let fail = |_: &[u8]| {
+            fails.fetch_add(1, Ordering::Relaxed);
+            Err::<HostShader, _>("unsupported".to_owned())
+        };
+        assert!(cached(&cache, &build, b"other", false, fail).is_err());
+        assert!(cached(&cache, &build, b"other", false, fail).is_err());
+        assert_eq!(fails.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn failures_are_kept_with_their_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let fails = AtomicU64::new(0);
+        let fail = |_: &[u8]| {
+            fails.fetch_add(1, Ordering::Relaxed);
+            Err::<HostShader, _>("unsupported: a lane mask".to_owned())
+        };
+        let error = Err("unsupported: a lane mask".to_owned());
+        assert_eq!(cached(&cache, &[7; 32], b"bad", true, fail), error);
+        assert_eq!(cached(&cache, &[7; 32], b"bad", true, fail), error);
+        assert_eq!(
+            fails.load(Ordering::Relaxed),
+            1,
+            "the second came from disk"
+        );
+
+        // A new translator tries again, and a success is served as before.
+        let ok = |_: &[u8]| Ok(shader());
+        assert_eq!(cached(&cache, &[8; 32], b"bad", true, ok), Ok(shader()));
+        assert_eq!(cached(&cache, &[8; 32], b"bad", true, fail), Ok(shader()));
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
