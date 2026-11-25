@@ -38,8 +38,10 @@ $taskName = "VIctory upstream rebase ($name)"
 
 if ($Register) {
     $script = $MyInvocation.MyCommand.Path
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (
-        "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass " +
+    # conhost --headless: no console window at all (powershell's own
+    # -WindowStyle Hidden still flashes one for a moment every run).
+    $action = New-ScheduledTaskAction -Execute 'conhost.exe' -Argument (
+        "--headless powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass " +
         "-File `"$script`" -Repo `"$Repo`" -Remote $Remote -UpstreamBranch $UpstreamBranch")
     $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
         -RepetitionInterval (New-TimeSpan -Minutes $Minutes)

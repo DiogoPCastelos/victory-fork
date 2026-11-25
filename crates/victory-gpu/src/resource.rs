@@ -1454,10 +1454,57 @@ pub(crate) fn room() -> bool {
         Some([budget, used, shared_budget, shared_used]) => {
             let own = budget / 100 * room_percent();
             let used = used + crate::shadow::card_room_kept() + targets_room_kept();
-            used < own || used + shared_used < own + shared_budget / 2
+            used < own || (used + shared_used < own + shared_budget / 2 && spill_commit_left())
         }
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// Whether the system's commit (RAM and page file) has more than
+/// `VICTORY_TEXTURE_SPILL_COMMIT_MB` (4,096; 0: not looked at) left, for
+/// textures past the card's own share. Shared memory is the PC's RAM: on a
+/// 16 GB machine, with this layer's card copies of title buffers (700 MB
+/// and more) and the title's own streaming, the spill took the commit to
+/// its limit within 3.5 minutes of a world run; draws were dropped by the
+/// thousands a frame (3,466 against 350 without the spill) and then the
+/// card copies could not be brought up to date (E_OUTOFMEMORY), which ends
+/// the run. The floor sits above the pipeline workers' (2,048,
+/// `VICTORY_PIPELINE_COMMIT_MB`) so textures stop spilling first. Asked at
+/// most every 100 ms.
+fn spill_commit_left() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static ASKED_MS: AtomicU64 = AtomicU64::new(0);
+    static LEFT: AtomicBool = AtomicBool::new(true);
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    let floor = *FLOOR.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_SPILL_COMMIT_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(4096)
+            << 20
+    });
+    if floor == 0 {
+        return true;
+    }
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1;
+    let asked = ASKED_MS.load(Relaxed);
+    if asked != 0 && now < asked + 100 {
+        return LEFT.load(Relaxed);
+    }
+    ASKED_MS.store(now, Relaxed);
+    let left = crate::host::available_commit().is_none_or(|free| free > floor);
+    LEFT.store(left, Relaxed);
+    if !left && !LOGGED.swap(true, Relaxed) {
+        tracing::warn!(
+            floor_mb = floor >> 20,
+            "textures stop spilling into shared memory: the system's commit is nearly used up \
+             (VICTORY_TEXTURE_SPILL_COMMIT_MB)"
+        );
+    }
+    left
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
