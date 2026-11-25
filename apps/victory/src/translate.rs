@@ -928,5 +928,6 @@ fn path_of(p: &NativeProgram) -> String {
     } else {
         "halves: no cross-lane code".to_owned()
     };
-    format!("{stage}: {what}; {took}")
+    let approx = if has(form::APPROX_LANE_WRITE) { " + a lane write where not every lane runs: APPROXIMATE" } else { "" };
+    format!("{stage}: {what}{approx}; {took}")
 }

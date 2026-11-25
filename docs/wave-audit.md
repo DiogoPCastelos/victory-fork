@@ -108,6 +108,55 @@ What this settles for the plan below:
   for an explicit report on such programs. Building that report needs a check for hand-written
   lane code in graphics programs, which the census does not do yet.
 
+## Reference model and lane tests (CLAUDE.md step 3)
+
+`crates/victory-shader/src/emit/lane_tests.rs`:
+- **`model`.** A CPU model of one 64-lane console wave, written from the public RDNA 2 ISA and
+  sharing no code with the translator. Lanes it does not claim to know are `None` and are
+  not compared: a `ds_bpermute` source lane outside EXEC, and `v_readfirstlane` with EXEC
+  empty.
+- **CPU test.** The model gives the handover's literal expectations: 31→32 gives 0x1020,
+  32→31 gives 0x101F, XOR-1 and XOR-32, the ballot of {0,31,32,63} gives 0x80000001 twice,
+  the first active lane of a high-half-only mask is 37, the sum of lane ids is 2016, the
+  exclusive prefix of ones gives each lane its own id.
+- **GPU tests.** Each is a synthetic one-wave program lowered for 32-lane waves (the
+  paired-wave exchange), validated by `dxil.dll` when present, and run on the hardware
+  device. Every lane is compared with the model:
+  - `ds_bpermute`: identity, both boundary reads, XOR-1/32/63, all 4,096 (source,
+    destination) pairs, in place and not, and 64 random EXEC/XOR/rotation cases each;
+  - `v_readlane`, `v_writelane` and `v_readfirstlane` under random masks;
+  - a ballot read as data, with `s_ff1_i32_b64` and `s_bcnt1_i32_b64` (48 cases);
+  - `v_mbcnt` prefixes (40 masks);
+  - the compiler's whole-wave sum;
+  - `v_cmpx` divergence across the boundary.
+
+  They print "NOT RUN" without a hardware device of 32-lane waves. Report them as not run,
+  never as passed.
+
+Run on the RTX 3060 Laptop, 2026-11-25: all eleven pass, every case on the hardware device
+(the eleventh: shuffles in groups of 48 and 96 threads, partial console waves and two console
+waves per group). Three translator defects were found and fixed on the way:
+1. **`v_writelane_b32` into a lane outside EXEC kept the old value.** The ISA's instruction
+   ignores EXEC. The write now skips the EXEC guard. Where not every lane reaches the
+   instruction, the target lane's thread may not be there. Refusing that case stopped 36 of
+   the title's programs, ray-traced shadows among them, so they translate as before and the
+   census marks them APPROXIMATE (36 wave32 compute programs; the census after these fixes
+   is otherwise the same as before them).
+2. **`ds_bpermute` across the two host waves of a console wave was refused.** It now goes
+   through 64 LDS dwords per console wave between two group barriers: the handover's
+   paired-wave shuffle (§7). This is only done where every thread of the group reaches it;
+   elsewhere it is still refused, with that reason.
+3. **Host waves were mapped to console lanes in arrival order (`wave_base`).** In a group
+   that is not a multiple of 32 threads, the short host wave could take console lanes 0..31,
+   leaving lanes with no thread: in a group of 48, lanes 16..31 read 0. This affects every
+   wave64 compute program of such a group size that runs as two host waves, not only
+   shuffles. Only full host waves now count off the counter; the short one takes the last run
+   (`group & !31`).
+
+Not covered yet: 3D groups, nested EXEC in loops, the ISA's rule that a `ds_bpermute` from a
+source lane outside EXEC reads 0 (the translator implements it; the model does not claim it),
+and graphics stages.
+
 ## Plan: the smallest steps, in order
 
 1. **Count the paths** (done: the census above). Add a census to `victory translate` of which lowering each

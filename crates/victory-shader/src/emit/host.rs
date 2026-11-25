@@ -17,6 +17,24 @@ pub struct Host {
     pub device: ID3D12Device,
 }
 
+#[cfg(test)]
+impl Host {
+    /// The device's `WaveLaneCountMin` and `WaveLaneCountMax` (`D3D12_FEATURE_D3D12_OPTIONS1`);
+    /// (0, 0) if it does not say.
+    pub fn wave_lanes(&self) -> (u32, u32) {
+        let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: a feature query into a structure of the size given.
+        let ok = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut o1).cast(),
+                size_of_val(&o1) as u32,
+            )
+        };
+        if ok.is_ok() { (o1.WaveLaneCountMin, o1.WaveLaneCountMax) } else { (0, 0) }
+    }
+}
+
 /// What the stage declares that a pipeline must match.
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;

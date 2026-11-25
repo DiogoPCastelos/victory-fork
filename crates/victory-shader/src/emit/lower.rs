@@ -262,6 +262,13 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
+    /// A console wave64 program in two host waves with `ds_bpermute`: the first of the 64 LDS
+    /// dwords per console wave its lanes write their data into, which every lane then reads at
+    /// the lane its address names (the handover's paired-wave shuffle).
+    permute_area: Option<u32>,
+    /// A `v_writelane_b32` where not every lane runs: its target lane may not be there to
+    /// take the value (`form::APPROX_LANE_WRITE`).
+    approx_lane_write: bool,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
@@ -1156,6 +1163,8 @@ pub mod form {
     pub const CONSOLE_LANES: u8 = 32;
     /// The program kept the console's 64-lane waves (`WaveSize(64)`).
     pub const WAVE64: u8 = 64;
+    /// A lane write where not every lane runs: APPROXIMATE (its target lane may be elsewhere).
+    pub const APPROX_LANE_WRITE: u8 = 128;
 }
 
 thread_local! {
@@ -1405,6 +1414,9 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        // `ds_bpermute` in a console wave64 program run as two host waves: the first LDS dword of
+        // the area each console wave writes its lanes into ([`Lower::permute_area`])
+        let mut permute: Option<u32> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
@@ -1487,6 +1499,12 @@ impl<'a> Lower<'a> {
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 s.lds_dwords += 2 * group.div_ceil(64);
+                                // `ds_bpermute` across the halves goes through 64 dwords per
+                                // console wave ([`Lower::permute_area`])
+                                if group > 32 && insts().any(|i| i.name() == "ds_bpermute_b32") {
+                                    permute = Some(s.lds_dwords);
+                                    s.lds_dwords += 64 * group.div_ceil(64);
+                                }
                             }
                         }
                     }
@@ -1693,6 +1711,8 @@ impl<'a> Lower<'a> {
             exchange,
             clane: None,
             pair: None,
+            permute_area: permute,
+            approx_lane_write: false,
             halves,
             wave_base: None,
             flat: None,
@@ -2424,6 +2444,7 @@ impl<'a> Lower<'a> {
                 (self.s.flags & flags::WAVE_OPS != 0, form::WAVE_OPS),
                 (self.console_lanes, form::CONSOLE_LANES),
                 (self.s.wave_size == Some(64), form::WAVE64),
+                (self.approx_lane_write, form::APPROX_LANE_WRITE),
             ]
             .into_iter()
             .filter(|&(on, _)| on)
@@ -3811,10 +3832,38 @@ impl<'a> Lower<'a> {
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
         let k32 = self.s.m.i32(32);
-        let add = self.s.m.select(e, first, k32, zero);
+        // A group that is not a multiple of 32 threads has one short host wave, and it can
+        // only be the last run of 32 console threads (group & !31). Taking the counter in
+        // arrival order, it could take base 0 and leave console lanes with no thread at all
+        // (a group of 48: the 16-thread wave first gave lanes 0..15, the full wave 32..63,
+        // and lanes 16..31 read 0; found by `lane_tests`). So only full waves count off
+        // the counter; the short one takes the last run.
+        let group = self.s.threads.map_or(0, |t| t.iter().product::<u32>());
+        let full = if group % 32 != 0 {
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let here = self.s.m.bool(true);
+            let ballot = self.s.op(e, "waveActiveBallot", Attr::NoUnwind, four, 116, &[here]);
+            let lo = self.s.m.extract(e, ballot, 0);
+            let all = self.s.m.i32(u32::MAX);
+            Some(self.s.m.cmp(e, pred::EQ, lo, all))
+        } else {
+            None
+        };
+        let counts = match full {
+            Some(f) => self.s.m.bin(e, Bin::And, first, f),
+            None => first,
+        };
+        let add = self.s.m.select(e, counts, k32, zero);
         let ptr = self.s.m.element(e, lds, k);
         let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
         let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        let base = match full {
+            Some(f) => {
+                let last = self.s.m.i32(group & !31);
+                self.s.m.select(e, f, base, last)
+            }
+            None => base,
+        };
         self.s.flags |= flags::WAVE_OPS;
         self.wave_base = Some(base);
         Some(base)
@@ -4584,9 +4633,63 @@ impl<'a> Lower<'a> {
             // host gives it; the console reads 0.
             self.cross_lane(false)?;
             if self.exchange.as_ref().is_some_and(|e| !e.1) {
-                // a console wave of 64 run as two host waves: the lane named
-                // may be in the other one
-                return Err("a lane permute across two host waves");
+                // A console wave of 64 run as two host waves: the lane named may be in the
+                // other one. Every lane writes its data (0 where EXEC leaves it out) to its
+                // console wave's 64 dwords, the group meets, every lane reads the dword of
+                // the lane its address names, and the group meets again before the dwords
+                // can be written anew (the handover's paired-wave shuffle). The meetings
+                // are group barriers, so every thread of the group must be here.
+                let Some(area) = self.permute_area else {
+                    return Err("a lane permute across two host waves");
+                };
+                if self.local || !self.all_lanes(self.cur_ir) {
+                    need(self.cur_ir);
+                    return Err("a lane permute across two host waves where not every lane runs");
+                }
+                let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
+                let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
+                let x = match guard {
+                    Some(g) => {
+                        let z = self.s.m.i32(0);
+                        self.s.m.select(c, g, x, z)
+                    }
+                    None => x,
+                };
+                let o = self.s.m.i32(offset);
+                let at = self.s.m.bin(c, Bin::Add, at, o);
+                let two = self.s.m.i32(2);
+                let src = self.s.m.bin(c, Bin::LShr, at, two);
+                let k63 = self.s.m.i32(63);
+                let src = self.s.m.bin(c, Bin::And, src, k63);
+                // thread t of the group writes dword area + t; its console wave's lane `src`
+                // is at area + (t & !63) + src
+                let thread = self.console_thread();
+                let lds = self.s.lds();
+                let base = self.s.m.i32(area);
+                let mine = self.s.m.bin(c, Bin::Add, base, thread);
+                let p = self.s.m.element(c, lds, mine);
+                self.s.m.store(c, p, x);
+                self.group_sync(c);
+                let not63 = self.s.m.i32(!63);
+                let wave = self.s.m.bin(c, Bin::And, thread, not63);
+                let theirs_thread = self.s.m.bin(c, Bin::Or, wave, src);
+                let theirs = self.s.m.bin(c, Bin::Add, base, theirs_thread);
+                let p = self.s.m.element(c, lds, theirs);
+                let r = self.s.m.load(c, p);
+                self.group_sync(c);
+                // a lane past the end of the group is not there on the console: 0
+                let group = self.s.threads.map_or(64, |t| t.iter().product::<u32>());
+                let r = if group % 64 != 0 {
+                    let n = self.s.m.i32(group);
+                    let there = self.s.m.cmp(c, pred::IULT, theirs_thread, n);
+                    let z = self.s.m.i32(0);
+                    self.s.m.select(c, there, r, z)
+                } else {
+                    r
+                };
+                let reg = dst_reg.ok_or("a permute result")?;
+                self.write(inst, Reg::V(reg), r, guard);
+                return Ok(());
             }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
@@ -7696,10 +7799,24 @@ impl<'a> Lower<'a> {
                 if self.local && !self.local_any {
                     return Err("a lane write in a half-wave");
                 }
+                // The ISA's `v_writelane_b32` ignores EXEC: the lane given takes the value
+                // even when it is not active, so the result is written without the EXEC
+                // guard (the select above already leaves every other lane as it was). Found
+                // by `lane_tests` (an inactive target lane kept its old value). Where not
+                // every lane reaches this code, the target lane's thread may not be here to
+                // take it: refused rather than lost.
+                let reached = all_lane_blocks(self.x.st)
+                    .is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false));
+                if !reached {
+                    // shortcut: translated all the same, and marked APPROXIMATE (the census of
+                    // `victory translate` lists it; `form::APPROX_LANE_WRITE`). Refusing them
+                    // stopped 36 of the title's programs, ray-traced shadows among them.
+                    self.approx_lane_write = true;
+                }
                 let me = self.console_lane();
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
-                int(self, r)
+                self.write_i(inst, r, None)
             }
             "v_readfirstlane_b32"
                 if inst
