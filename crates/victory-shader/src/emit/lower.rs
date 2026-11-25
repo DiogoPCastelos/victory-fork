@@ -2416,13 +2416,18 @@ impl<'a> Lower<'a> {
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         LAST_FORM.set(
-            u8::from(self.exchange.is_some()) * form::EXCHANGE
-                | u8::from(self.split_lds) * form::SPLIT_LDS
-                | u8::from(self.local) * form::LOCAL
-                | u8::from(self.local_any) * form::LOCAL_ANY
-                | u8::from(self.s.flags & flags::WAVE_OPS != 0) * form::WAVE_OPS
-                | u8::from(self.console_lanes) * form::CONSOLE_LANES
-                | u8::from(self.s.wave_size == Some(64)) * form::WAVE64,
+            [
+                (self.exchange.is_some(), form::EXCHANGE),
+                (self.split_lds, form::SPLIT_LDS),
+                (self.local, form::LOCAL),
+                (self.local_any, form::LOCAL_ANY),
+                (self.s.flags & flags::WAVE_OPS != 0, form::WAVE_OPS),
+                (self.console_lanes, form::CONSOLE_LANES),
+                (self.s.wave_size == Some(64), form::WAVE64),
+            ]
+            .into_iter()
+            .filter(|&(on, _)| on)
+            .fold(0, |bits, (_, bit)| bits | bit),
         );
         Ok(Lowered {
             wave_size,
