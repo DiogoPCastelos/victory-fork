@@ -1137,6 +1137,40 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     result
 }
 
+/// What the last successful lowering on this thread did with the console's lanes
+/// ([`last_form`]), for the census of `victory translate`.
+pub mod form {
+    /// Lanes 32..63 are the other host wave: masks, lane reads and lane numbers go through
+    /// LDS dwords the two host waves exchange (with group barriers).
+    pub const EXCHANGE: u8 = 1;
+    /// LDS the console shares within one wave, split over two host waves with a group
+    /// barrier before each access.
+    pub const SPLIT_LDS: u8 = 2;
+    /// Each host wave lowered as a wave of its own (no exchange between the halves).
+    pub const LOCAL: u8 = 4;
+    /// ... with every mask and lane read per host wave too: approximate.
+    pub const LOCAL_ANY: u8 = 8;
+    /// DXIL wave operations in the result.
+    pub const WAVE_OPS: u8 = 16;
+    /// Code that reads other lanes, or lane masks as numbers (needs the console's lane order).
+    pub const CONSOLE_LANES: u8 = 32;
+    /// The program kept the console's 64-lane waves (`WaveSize(64)`).
+    pub const WAVE64: u8 = 64;
+}
+
+thread_local! {
+    static LAST_FORM: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// The [`form`] bits of the last successful lowering on this thread.
+pub fn last_form() -> u8 {
+    LAST_FORM.get()
+}
+
+pub(super) fn set_last_form(bits: u8) {
+    LAST_FORM.set(bits);
+}
+
 pub(super) fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
@@ -2381,6 +2415,15 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        LAST_FORM.set(
+            u8::from(self.exchange.is_some()) * form::EXCHANGE
+                | u8::from(self.split_lds) * form::SPLIT_LDS
+                | u8::from(self.local) * form::LOCAL
+                | u8::from(self.local_any) * form::LOCAL_ANY
+                | u8::from(self.s.flags & flags::WAVE_OPS != 0) * form::WAVE_OPS
+                | u8::from(self.console_lanes) * form::CONSOLE_LANES
+                | u8::from(self.s.wave_size == Some(64)) * form::WAVE64,
+        );
         Ok(Lowered {
             wave_size,
             cmp_samplers,

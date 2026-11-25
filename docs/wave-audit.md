@@ -71,9 +71,46 @@ missing against the handover:
   rely only on HLSL's guarantees, which compiler-generated reductions do. It is
   not proven for hand-written lane code in pixel programs.
 
+## Census: the paths the title's programs take (32-lane host)
+
+`VICTORY_HOST_WAVE=32 VICTORY_VIEW_LIMIT=999999 victory translate <pack>` prints the census
+of lowering paths (`--list` gives one line per program). Measured 2026-11-25 on the title's
+pack: 26,555 containers (614 duplicates), 25,687 programs emitted.
+
+| Programs | Stage, console wave | Path |
+|---:|---|---|
+| 1,569 | compute, wave32 | as it is |
+| 1,123 | pixel, wave32 | as it is |
+| 527 | compute, wave64 | 32-lane halves, no cross-lane code |
+| 263 | compute, wave64 | 32-lane halves, cross-lane code confined to halves |
+| 116 | compute, wave64 | two host waves exchanging lanes through LDS (59 first try, 57 in a retried form) |
+| 48 | compute, wave64 | the same with the console's shared LDS split (lane exchange too) |
+| 111 | compute, wave64 | shared LDS split only |
+| 27 | compute, wave64 | each half its own wave, the allocation idiom (exact, one unchecked step) |
+| **38** | compute, wave64 | **each half its own wave: APPROXIMATE** (27, plus 11 with every mask and lane read per half) |
+| **27** | compute, wave64 | **kept 64-lane waves: a 32-lane host refuses the pipeline** |
+| 6,585 / 532 / 8,762 | pixel / vertex / mesh, wave64 | per lane, wave operations over the host's wave (HLSL's contract) |
+| 4,300 / 1,659 | pixel / vertex, wave64 | per lane, no cross-lane code |
+
+Not emitted: 195 (an address in an SGPR that is no root parameter), 40 (a descriptor chosen
+by control flow), 10 (a hardware SGPR input), 5 (a descriptor read only as data), 2 (a lane
+mask holding lanes elsewhere read as data), 1 (a lane mask exchanged where not every lane
+runs), 1 (an opaque lane mask). This census does not validate or build pipelines: add
+`--validate --pipelines` for those numbers.
+
+What this settles for the plan below:
+- **Step 4.** Making the approximate fallback opt-in would stop 38 compute programs
+  from running. They are the handover's dual-bank or paired targets.
+- **Dual-bank target set.** Together with the 27 that keep 64-lane waves, that's 65 compute
+  programs (about 2.4% of the 2,734) without an exact path on this GPU.
+- **Graphics.** 15,879 wave64 graphics programs use wave operations under HLSL's contract.
+  Whether any of them depend on the console's 64-lane grouping is unproven. CLAUDE.md asks
+  for an explicit report on such programs. Building that report needs a check for hand-written
+  lane code in graphics programs, which the census does not do yet.
+
 ## Plan: the smallest steps, in order
 
-1. **Count the paths.** Add a census to `victory translate` of which lowering each
+1. **Count the paths** (done: the census above). Add a census to `victory translate` of which lowering each
    program took: native 32, native 64, halves exchanging through LDS, local
    (idiom), local (approximate), refused. Run it on the pack with
    `VICTORY_HOST_WAVE=32`. This decides step 4 with numbers rather than guesses.

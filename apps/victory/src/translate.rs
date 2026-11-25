@@ -71,6 +71,9 @@ struct Tally {
     ms_pipelines: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
+    /// The census of lowering paths: what the translator did with the console's lanes,
+    /// by stage and wave size → programs, and the first one ([`path_of`]).
+    paths: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
@@ -91,6 +94,9 @@ impl Tally {
     }
 
     fn merge(&mut self, other: Tally) {
+        for (k, (n, e)) in other.paths {
+            self.paths.entry(k).or_insert((0, e)).0 += n;
+        }
         self.containers += other.containers;
         self.duplicates += other.duplicates;
         self.programs += other.programs;
@@ -374,6 +380,14 @@ pub fn run(
             println!("pair {v} + {p}: {made}");
         }
     }
+    if !t.paths.is_empty() {
+        println!("lowering paths (host waves of at most {} lanes; programs that translated):", host_wave_note());
+        let mut paths: Vec<_> = t.paths.iter().collect();
+        paths.sort();
+        for (path, (n, example)) in paths {
+            println!("  {n:>7}  {path}  (e.g. {example})");
+        }
+    }
     let mut lines = t.lines;
     lines.sort();
     for l in lines {
@@ -541,6 +555,11 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                     match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
+                            let path = path_of(&p);
+                            if t.list {
+                                t.lines.push(format!("{}  path: {path}", label()));
+                            }
+                            t.paths.entry(path).or_insert_with(|| (0, label())).0 += 1;
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
                         }
@@ -863,4 +882,51 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What `VICTORY_HOST_WAVE` says of the host's waves, for the census heading.
+fn host_wave_note() -> String {
+    std::env::var("VICTORY_HOST_WAVE").unwrap_or_else(|_| "?".to_owned())
+}
+
+/// The census line of a program that just translated: its stage and the console's wave size,
+/// then what the translation did with the console's lanes ([`emit::last_path`]). Wave32
+/// programs run as they are; for wave64 ones on a 32-lane host the line says whether the
+/// halves needed nothing from each other, exchanged through LDS, or each ran on its own
+/// (exactly for the allocation idiom, otherwise APPROXIMATE), and which attempt gave it.
+fn path_of(p: &NativeProgram) -> String {
+    use emit::form;
+    let (took, bits) = emit::last_path();
+    let has = |b: u8| bits & b != 0;
+    let stage = format!("{:?} wave{}", p.stage, if p.wave64 { 64 } else { 32 });
+    let what = if !p.wave64 {
+        "as it is".to_owned()
+    } else if has(form::WAVE64) {
+        "kept 64-lane waves (a 32-lane host refuses the pipeline)".to_owned()
+    } else if p.stage != HwStage::Cs {
+        if has(form::WAVE_OPS) || has(form::CONSOLE_LANES) {
+            "per lane, wave operations over the host's wave (HLSL's contract, not the console's 64 lanes)".to_owned()
+        } else {
+            "per lane, no cross-lane code".to_owned()
+        }
+    } else if has(form::LOCAL_ANY) {
+        "each half its own wave, every mask and lane read too: APPROXIMATE".to_owned()
+    } else if has(form::LOCAL) {
+        if took.contains("APPROXIMATE") {
+            "each half its own wave: APPROXIMATE".to_owned()
+        } else {
+            "each half its own wave: the allocation idiom (exact)".to_owned()
+        }
+    } else if has(form::EXCHANGE) || has(form::SPLIT_LDS) {
+        format!(
+            "two host waves meeting through LDS ({}{})",
+            if has(form::EXCHANGE) { "lane exchange" } else { "" },
+            if has(form::SPLIT_LDS) { if has(form::EXCHANGE) { ", shared LDS split" } else { "shared LDS split" } } else { "" }
+        )
+    } else if has(form::CONSOLE_LANES) || has(form::WAVE_OPS) {
+        "halves: cross-lane code inside 32-lane halves".to_owned()
+    } else {
+        "halves: no cross-lane code".to_owned()
+    };
+    format!("{stage}: {what}; {took}")
 }

@@ -110,7 +110,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::set_host_max_wave;
+pub use lower::{form, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -340,6 +340,23 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+thread_local! {
+    /// Which of [`emit`]'s attempts gave the last result on this thread ([`last_path`]).
+    static TOOK: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+fn took(what: &'static str) {
+    TOOK.set(what);
+}
+
+/// How the last translation on this thread came about, for the census of `victory
+/// translate`: which attempt of [`emit`] gave it (the first try, a retry in another form, the
+/// local-wave forms, some of them approximate) and what its lowering did with the console's
+/// lanes ([`lower::form`] bits). Meaningful right after a translation that succeeded.
+pub fn last_path() -> (&'static str, u8) {
+    (TOOK.get(), lower::last_form())
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -349,9 +366,12 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    took("first try");
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    lower::set_last_form(0);
     let original = emit_program(c, native, p, st, io, res);
+    let original_form = lower::last_form();
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -413,6 +433,7 @@ pub fn emit(
                 let again = emit_program(c, native, p, st, io, res);
                 report(name, &again);
                 if done(&again) {
+                    took("retry: another form of the program");
                     return again.map(|(shader, _)| shader);
                 }
             }
@@ -438,6 +459,7 @@ pub fn emit(
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
+                        took("retry: skips left out");
                         return again.map(|(shader, _)| shader);
                     }
                 }
@@ -455,6 +477,7 @@ pub fn emit(
                         let again = widen(c, native, base, why);
                         report("wave-wide branches", &again);
                         if done(&again) {
+                            took("retry: wave-wide branches");
                             return again.map(|(shader, _)| shader);
                         }
                     }
@@ -473,6 +496,7 @@ pub fn emit(
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
+                        took(if exact { "local waves: the allocation idiom (exact)" } else { "local waves: APPROXIMATE" });
                         return local.map(|(shader, _)| shader);
                     }
                 }
@@ -481,6 +505,7 @@ pub fn emit(
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
+                    took(if exact { "local waves: the allocation idiom (exact)" } else { "local waves: APPROXIMATE" });
                     return local.map(|(shader, _)| shader);
                 }
             }
@@ -493,6 +518,7 @@ pub fn emit(
                         let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
+                            took("local waves: APPROXIMATE, any mask");
                             return local.map(|(shader, _)| shader);
                         }
                     }
@@ -500,11 +526,15 @@ pub fn emit(
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
+                    took("local waves: APPROXIMATE, any mask");
                     return local.map(|(shader, _)| shader);
                 }
             }
         }
     }
+    // (a retry that lowered but was not taken must not stand for the original)
+    lower::set_last_form(original_form);
+    took("first try");
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
     // lowering has named the skipped blocks).
@@ -514,6 +544,7 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
+            took("retry: wave-wide skip");
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
             match again {
                 Ok(_) => again,
@@ -532,6 +563,7 @@ pub fn emit(
     if edges.is_empty() {
         return original;
     }
+    took("retry: jump threading");
     let p = ir::thread_edges(p, &edges)?;
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
