@@ -47,10 +47,10 @@ You need:
   Memory → Committed). If it crashes with Windows error 1455, close other programs or make
   the page file larger.
 
-**1. Build**
+**1. Build with screenshot support**
 
 ```powershell
-cargo build --release -p victory
+cargo build --profile diag -p victory --features diagnostics
 ```
 
 **2. Warm the shader cache** (optional, strongly recommended: about 5 minutes, once per
@@ -60,18 +60,32 @@ values must match the GPU you will run on. For any NVIDIA GPU:
 ```powershell
 $env:VICTORY_HOST_WAVE = 32
 $env:VICTORY_VIEW_LIMIT = 999999
-target\release\victory.exe translate "<game folder>" --warm all
+target\diag\victory.exe translate "<game folder>" --warm all
 Remove-Item Env:VICTORY_HOST_WAVE, Env:VICTORY_VIEW_LIMIT
 ```
 
-**3. Run**
+**3. Run with automatic screenshots**
+
+Run these commands from the repository root. Each launch gets its own folder under
+`%LOCALAPPDATA%\victory\runs` for the log, screenshots and render layers.
 
 ```powershell
-target\release\victory.exe run "<game folder>\<the game's .exe>" --execute > run.log 2>&1
+$runDir = Join-Path $env:LOCALAPPDATA ("victory\runs\" + (Get-Date -Format "yyyyMMdd-HHmmss"))
+New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+$env:VICTORY_CAPTURE = $runDir
+$env:VICTORY_CAPTURE_WORLD = 1
+$env:VICTORY_CAPTURE_WORLD_ALSO = "60,150,300"
+$env:VICTORY_DUMP_TARGETS = 1
+Write-Host "Saving this run to $runDir"
+target\diag\victory.exe run "<game folder>\<the game's .exe>" --execute > "$runDir\run.log" 2>&1
 ```
 
 Press Enter through the menus. The first launch also builds the GPU's pipelines (minutes in
 the menus); later launches reuse them. The window title shows the frame rate.
+
+Once the runtime detects the world, it saves selected frames automatically. In the run
+folder, `frame-<n>.png` is the screenshot. The longer filenames starting with the same
+frame number are its render layers. Saving those frames can briefly slow the game.
 
 - The game's files are only read, never written.
 - The layer's cache is in `%LOCALAPPDATA%\victory\cache` (safe to delete).
@@ -94,18 +108,14 @@ the menus); later launches reuse them. The window title shows the frame rate.
 - `video memory as the system counts it`: GPU memory;
 - `ERROR`.
 
-Captures of frames and render targets need the diagnostics build
-(`cargo build --profile diag -p victory --features diagnostics`; see
-[docs/HANDOVER.md](docs/HANDOVER.md)).
-
 ## Reporting a run
 
 Ran it? Please open an issue, whether it worked or not, following
 **[CONTRIBUTING.md](CONTRIBUTING.md)** (the issue form asks for the same):
 - your full specs: GPU and its dedicated memory, driver, CPU, RAM, page file, Windows build;
 - your `run.log`, uploaded;
-- screenshots in game: the picture and its render layers (base colour, normals, and the
-  rest), captured with the diagnostics build as CONTRIBUTING.md shows.
+- the screenshot and matching render layers from the run folder (including base colour
+  and normals) for one or two frames that show the problem.
 
 ## Credits
 
