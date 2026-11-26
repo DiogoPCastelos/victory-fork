@@ -181,10 +181,16 @@ any wave32 program, with `WaveSize(32)` pinned.
   - `ds_bpermute` reads both banks and picks by bit 5 of the lane it names.
   - EXEC- and VCC-zero branches test both halves of the pair.
 
-  None of the added code writes SCC or VCC.
+  None of the added code writes SCC or VCC, except the far jumps below, which save SCC and set
+  it again before they jump.
+- **Far jumps.** The program's own far jumps (`s_getpc_b64`, `s_add_u32` of a literal,
+  `s_addc_u32`, `s_setpc_b64`) get their offset again after the rewrite. A branch that the
+  growth puts out of reach of its 16-bit offset becomes a far jump of the rewrite's own, in
+  the scratch SGPR pair. Conditional branches become the opposite branch over the far jump.
+  The rewrite is done again until every branch reaches.
 - **Refused, with a reason:**
   - more than 124 VGPRs;
-  - program-counter instructions;
+  - program-counter instructions other than far jumps;
   - scratch memory and buffer loads into LDS (per-lane addresses the two banks would share);
   - `ds_permute`, `ds_append`/`ds_consume`, ordered counts, GWS, `*_addtid`;
   - DPP compares and SDWA `v_cmpx`, and DPP/SDWA forms of VOP2 with an implicit VCC in
@@ -220,6 +226,13 @@ translator limits. Not measured yet: whether dual-bank or the paired path is fas
 where the paired path has no exact form, so the defaults for programs that had one are
 unchanged.
 
+Far jumps (2026-11-26, census of the title's pack, 32-lane host): dual-bank takes 51 compute
+programs (47 before). These are the compute program the opening dropped in every world frame
+(no exact form before: a lane mask exchanged where not every lane runs, and dual-bank refused
+its far jump), and 3 that were on an APPROXIMATE half-wave form (15 → 12). All four pass
+`dxil.dll` and build a pipeline on the RTX 3060. Compute programs that do not translate: 6 → 5.
+Not seen yet in a game run.
+
 ### More lane tests (both paths)
 
 - **3D groups** (4×4×4, one console wave; 8×4×4, two): lanes follow the linear thread id,
@@ -228,6 +241,13 @@ unchanged.
 - **A loop with a per-lane trip count** that differs between the halves, left lane by lane
   (`s_and_b64 exec, exec, vcc`, `s_cbranch_execz`), with an if inside on odd iterations
   (saveexec, execz, `s_or_b64` back). This is nested EXEC inside a loop.
+
+- **Far jumps** (2026-11-26): `s_cbranch_scc1` and `s_cbranch_execz`, each over 10,000
+  instructions, which the rewrite puts out of reach. SCC is read after the first (a far jump
+  must keep it). Then a far jump of the program's own over a block that must not run, then a
+  `ds_bpermute` across the halves. 12 cases (s0 picks the first branch, s1 the lanes of the
+  second). The dual-bank case also checks that the rewrite made the far jumps. A far jump made
+  to forget SCC fails it.
 
 All of them pass on the RTX 3060 through both the paired and the dual-bank path.
 

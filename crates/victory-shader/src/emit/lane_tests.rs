@@ -1096,3 +1096,98 @@ fn dual_bank_a_dpp_compare_reads_its_row_neighbour() {
     a_dpp_compare_reads_its_row_neighbour();
     DUAL.set(false);
 }
+
+/// Far jumps (`docs/wave-audit.md`, dual-bank): a program whose branches the dual-bank
+/// rewrite puts out of reach of their 16-bit offset (a `s_cbranch_scc1` and a
+/// `s_cbranch_execz`, each over 10,000 instructions, which the rewrite writes about four times
+/// as long), with SCC read after the first one (a far jump must leave it as it was), then the
+/// compiler's own far jump (`s_getpc_b64`, `s_add_u32`, `s_addc_u32`, `s_setpc_b64`) over a
+/// block that must not run, then lane g takes lane g ^ 32's value (`ds_bpermute`). s0 picks
+/// the first branch, s1 the lanes of the second region.
+#[test]
+fn branches_out_of_reach_after_the_rewrite_go_as_far_jumps() {
+    use crate::gfx10::{Encoding, opcode};
+    const N: u32 = 10_000;
+    let o = |e: Encoding, name: &str| u32::from(opcode(e, name).unwrap_or_else(|| panic!("{name}")));
+    let sop1 = |name: &str, sdst: u32, ssrc0: u32| 0xBE80_0000 | sdst << 16 | o(Encoding::Sop1, name) << 8 | ssrc0;
+    let sop2 = |name: &str, sdst: u32, ssrc0: u32, ssrc1: u32| {
+        0x8000_0000 | o(Encoding::Sop2, name) << 23 | sdst << 16 | ssrc1 << 8 | ssrc0
+    };
+    let sopc = |name: &str, ssrc0: u32, ssrc1: u32| 0xBF00_0000 | o(Encoding::Sopc, name) << 16 | ssrc1 << 8 | ssrc0;
+    let sopp = |name: &str| 0xBF80_0000 | o(Encoding::Sopp, name) << 16;
+    let mut w = prologue();
+    w.push(vop1(V_MOV_B32, 12, v(1))); // x = 0x1000 + lane
+    w.push(sopc("s_cmp_eq_u32", 0, int(0))); // SCC = s0 == 0
+    let a = w.len();
+    w.push(sopp("s_cbranch_scc1"));
+    w.extend((0..N).map(|_| vop2(V_ADD_NC_U32, 12, int(1), 12)));
+    let a_end = w.len();
+    w.push(sop2("s_cselect_b32", 6, int(3), int(5))); // s6 = s0 == 0 ? 3 : 5
+    w.push(vop2(V_ADD_NC_U32, 12, 6, 12));
+    w.push(vopc(V_CMPX_GT_U32, 1, 0)); // exec: lanes below s1
+    let b = w.len();
+    w.push(sopp("s_cbranch_execz"));
+    // (a branch inside: the region is no straight-line skip, which the rewrite leaves out)
+    w.push(sopp("s_branch"));
+    w.extend((0..N).map(|_| vop2(V_ADD_NC_U32, 12, int(2), 12)));
+    let b_end = w.len();
+    w.push(sop1("s_mov_b64", EXEC, 22));
+    let getpc = w.len();
+    w.push(sop1("s_getpc_b64", 30, 0));
+    w.push(sop2("s_add_u32", 30, 30, LITERAL));
+    let literal = w.len();
+    w.push(0);
+    w.push(sop2("s_addc_u32", 31, 31, int(0)));
+    w.push(sop1("s_setpc_b64", 0, 30));
+    w.push(vop1(V_MOV_B32, 12, LITERAL)); // skipped
+    w.push(0xBAD0_0000);
+    let target = w.len();
+    w.push(vop2(V_XOR_B32, 2, int(32), 0)); // v2 = (lane ^ 32) * 4
+    w.push(vop2(V_LSHLREV_B32, 2, int(2), 2));
+    w.extend(ds(DS_BPERMUTE_B32, 12, 2, 12));
+    w.push(S_WAITCNT_LGKM0);
+    epilogue(&mut w);
+    let rel = |from: usize, to: usize| (to as i32 - (from as i32 + 1)) as u16 as u32;
+    w[a] |= rel(a, a_end);
+    w[b] |= rel(b, b_end);
+    w[literal] = 4 * (target - (getpc + 1)) as u32;
+    if DUAL.get() {
+        // the rewrite does make far jumps of the two branches (and keeps the program's own)
+        let native = crate::dualbank::transform(&native_of(&w, true, 64)).expect("rewritten");
+        let setpc = crate::gfx10::decode(&native.code)
+            .expect("decodes")
+            .iter()
+            .filter(|i| i.name() == Some("s_setpc_b64"))
+            .count();
+        assert_eq!(setpc, 3, "far jumps in the rewritten program");
+    }
+    let _one = one_at_a_time();
+    let Some(card) = card("far jumps", &w) else { return };
+    for s0 in [0u32, 1] {
+        for s1 in [0u32, 1, 31, 32, 33, 64] {
+            let x: [u32; 64] = std::array::from_fn(|g| {
+                let g = g as u32;
+                let mut x = 0x1000 + g;
+                if s0 != 0 {
+                    x += N;
+                }
+                x += if s0 == 0 { 3 } else { 5 };
+                if g < s1 {
+                    x += 2 * N;
+                }
+                x
+            });
+            let want: [u32; 64] = std::array::from_fn(|g| x[g ^ 32]);
+            let got = card.run([s0, s1, 0, 0]);
+            compare(&format!("far jumps, s0 {s0}, s1 {s1}"), &got, &some(want));
+        }
+    }
+    eprintln!("far jumps: 12 cases as the model");
+}
+
+#[test]
+fn dual_bank_branches_out_of_reach_after_the_rewrite_go_as_far_jumps() {
+    DUAL.set(true);
+    branches_out_of_reach_after_the_rewrite_go_as_far_jumps();
+    DUAL.set(false);
+}

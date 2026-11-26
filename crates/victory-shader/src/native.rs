@@ -11,6 +11,8 @@
 //!               u32 kind, u32 offset, u32 size
 //! kind 0x0d     "XBCH" u32 version (3), u64 packed size, u64 unpacked size,
 //!               zlib stream
+//! kind 0x0c     the same "FSSM" stored as it is, not packed (seen in a few
+//!               programs kept in a title's executable)
 //! unpacked      "FSSM" u32 version (0x101), u64 payload size, payload
 //! payload +0x00 u64 graphics slot count (6)
 //!         +0x08 u64 record offsets: LS HS ES GS VS PS (0x08..0x30),
@@ -74,6 +76,8 @@ use crate::dxbc::{u32_at, u64_at};
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
 const KIND_NATIVE: u32 = 0x0d;
+/// Native programs stored as an `FSSM` blob as it is, not packed in an `XBCH`.
+const KIND_NATIVE_PLAIN: u32 = 0x0c;
 const XBCH_VERSION: u32 = 3;
 const XBCH_HEADER: usize = 0x18;
 const FSSM_VERSION: u32 = 0x101;
@@ -421,13 +425,19 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     let mut out = Vec::new();
     for i in 0..count {
         let at = XDAT_OFFSET + 12 + 12 * i;
-        if u32_at(part, at)? != KIND_NATIVE {
+        let kind = u32_at(part, at)?;
+        if kind != KIND_NATIVE && kind != KIND_NATIVE_PLAIN {
             continue;
         }
         let offset = u32_at(part, at + 4)?.into();
         let size = u32_at(part, at + 8)?.into();
         let blob = bytes(part, offset, size).ok_or(Malformed("XDAT entry out of bounds"))?;
-        out.extend(programs(&unpack(blob)?)?);
+        match kind {
+            KIND_NATIVE => out.extend(programs(&unpack(blob)?)?),
+            // (anything else stored under that kind is not read)
+            _ if blob.starts_with(b"FSSM") => out.extend(programs(blob)?),
+            _ => {}
+        }
     }
     Ok(out)
 }
@@ -1042,6 +1052,23 @@ mod tests {
             .map(|p| p.stage)
             .collect();
         assert_eq!(stages, [HwStage::Es, HwStage::Vs]);
+    }
+
+    /// An `FSSM` stored as it is (kind 0x0c, beside a hash and a program header) gives the
+    /// programs its packed form gives; other data under that kind is not read, and a damaged
+    /// `FSSM` is still an error.
+    #[test]
+    fn reads_native_blobs_stored_unpacked() {
+        let plain = fssm(&[(HwStage::Vs, &VS_CODE), (HwStage::Ps, &PS_CODE)]);
+        let packed = native_programs(&part(&[(KIND_NATIVE, &xbch(&plain))])).unwrap();
+        let unpacked =
+            native_programs(&part(&[(0x12, &[0; 16]), (KIND_NATIVE_PLAIN, &plain), (0x07, b"NOBC")])).unwrap();
+        assert_eq!(packed.len(), 2);
+        assert_eq!(unpacked, packed);
+        assert!(native_programs(&part(&[(KIND_NATIVE_PLAIN, b"not a program")])).unwrap().is_empty());
+        let mut unknown_version = plain.clone();
+        unknown_version[4] = 9;
+        assert!(native_programs(&part(&[(KIND_NATIVE_PLAIN, &unknown_version)])).is_err());
     }
 
     #[test]

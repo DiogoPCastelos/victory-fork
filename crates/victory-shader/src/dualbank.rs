@@ -25,9 +25,14 @@
 //!   EXEC or VCC being zero test both halves of the pair. None of the added code writes SCC
 //!   or VCC.
 //!
+//! - Far jumps. The code grows (every vector instruction twice), so the compiler's far jumps
+//!   (`s_getpc_b64`, `s_add_u32` of a literal, `s_addc_u32`, `s_setpc_b64`) get their offset
+//!   again after the rewrite, and a branch the growth puts out of reach of its 16-bit offset
+//!   becomes a far jump of the rewrite's own ([`far_jump`]), which leaves SCC as it was.
+//!
 //! Refused (with a reason), for this first version: thread groups whose dimensions are not
-//! powers of two, more than 124 VGPRs, no spare SGPRs, program-counter instructions
-//! (`s_getpc_b64`...: inserted code moves the program), scratch memory and LDS loads from
+//! powers of two, more than 124 VGPRs, no spare SGPRs, program-counter instructions other
+//! than far jumps (inserted code moves the program), scratch memory and LDS loads from
 //! buffers (per-lane addresses the two banks would share), `ds_permute_b32`,
 //! `ds_append`/`ds_consume`/ordered counts/GWS, `*_addtid`, and SDWA or DPP forms of the
 //! instructions bank 1 has to rewrite (VOPC, VOP2 with an implicit VCC).
@@ -147,11 +152,90 @@ impl Out {
 }
 
 /// The program rewritten for dual-bank execution, or why not.
+///
+/// Which branches the growth puts out of reach is known only once the code is laid out: the
+/// rewrite is done again with those as far jumps until every branch reaches.
 pub fn transform(native: &NativeProgram) -> Result<NativeProgram, ShaderError> {
-    rewrite(native).map_err(|what| ShaderError::Unsupported { offset: 0, what })
+    let mut far = std::collections::HashSet::new();
+    loop {
+        let mut out_of_reach = Vec::new();
+        match rewrite(native, &far, &mut out_of_reach) {
+            Err(TOO_FAR) if out_of_reach.iter().any(|n| !far.contains(n)) => far.extend(out_of_reach),
+            r => return r.map_err(|what| ShaderError::Unsupported { offset: 0, what }),
+        }
+    }
 }
 
-fn rewrite(native: &NativeProgram) -> Result<NativeProgram, Why> {
+const TOO_FAR: Why = "dual-bank: a branch too far after the rewrite";
+
+/// Words of a far jump of the rewrite's own ([`far_jump`]).
+const FAR_JUMP_WORDS: u32 = 7;
+
+/// A far jump to instruction `t`, as the compiler writes one, in the scratch SGPR pair, with
+/// SCC kept (saved in `sa` and set again before the jump): `s_cselect_b32 sa, 1, 0`,
+/// `s_getpc_b64`, `s_add_u32` of the offset, `s_addc_u32` of its sign, `s_cmp_lg_u32 sa, 0`,
+/// `s_setpc_b64`. The offset is filled in once the code is laid out (`fixups`: the getpc's
+/// word, the literal's, the carry's, and `t`).
+fn far_jump(out: &mut Out, r: &Regs, t: usize, fixups: &mut Vec<(usize, usize, usize, usize)>) -> Result<(), Why> {
+    out.sop2("s_cselect_b32", r.sa, int(1), int(0))?;
+    let getpc = out.words.len();
+    out.sop1("s_getpc_b64", r.st, 0)?;
+    out.sop2("s_add_u32", r.st, r.st, LITERAL)?;
+    let literal = out.words.len();
+    out.push(&[0]);
+    let carry = out.words.len();
+    out.sop2("s_addc_u32", r.st + 1, r.st + 1, int(0))?;
+    let cmp = op(Encoding::Sopc, "s_cmp_lg_u32")?;
+    out.push(&[0xBF00_0000 | cmp << 16 | int(0) << 8 | r.sa]);
+    out.sop1("s_setpc_b64", 0, r.st)?;
+    fixups.push((getpc, literal, carry, t));
+    Ok(())
+}
+
+/// The program's own far jumps: the `s_getpc_b64` of each, by instruction index, with the
+/// index of the instruction it goes to, that of its `s_add_u32`/`s_sub_u32`, and whether
+/// it subtracts.
+fn title_far_jumps(
+    insts: &[Instruction],
+    index_of: &std::collections::HashMap<usize, usize>,
+) -> Result<std::collections::HashMap<usize, (usize, usize, bool)>, Why> {
+    let mut far = std::collections::HashMap::new();
+    for n in 3..insts.len() {
+        let [getpc, add, carry, setpc] = [&insts[n - 3], &insts[n - 2], &insts[n - 1], &insts[n]];
+        if setpc.name() != Some("s_setpc_b64") || getpc.name() != Some("s_getpc_b64") {
+            continue;
+        }
+        let pair = setpc.words[0] & 0xFF;
+        let w = add.words[0];
+        let adds = matches!(add.name(), Some("s_add_u32" | "s_sub_u32"))
+            && add.words.len() == 2
+            && w >> 16 & 0x7F == pair
+            && w & 0xFF == pair
+            && w >> 8 & 0xFF == LITERAL;
+        let carries = matches!(carry.name(), Some("s_addc_u32" | "s_subb_u32")) && carry.words[0] >> 16 & 0x7F == pair + 1;
+        if !adds || !carries || getpc.words[0] >> 16 & 0x7F != pair {
+            continue;
+        }
+        let sub = add.name() == Some("s_sub_u32");
+        let literal = i64::from(add.words[1] as i32);
+        // s_getpc_b64 gives the address of the instruction after it
+        let target = getpc.offset as i64 + 4 + if sub { -literal } else { literal };
+        let t = usize::try_from(target)
+            .ok()
+            .and_then(|t| index_of.get(&t))
+            .ok_or("dual-bank: a far jump into an instruction")?;
+        far.insert(n - 3, (*t, n - 2, sub));
+    }
+    Ok(far)
+}
+
+/// `far`: the branches (instruction indices) written as far jumps; those still out of reach
+/// go to `out_of_reach` (with [`TOO_FAR`]).
+fn rewrite(
+    native: &NativeProgram,
+    far: &std::collections::HashSet<usize>,
+    out_of_reach: &mut Vec<usize>,
+) -> Result<NativeProgram, Why> {
     if native.stage != HwStage::Cs || !native.wave64 {
         return Err("dual-bank: not a console wave64 compute program");
     }
@@ -215,19 +299,39 @@ fn rewrite(native: &NativeProgram) -> Result<NativeProgram, Why> {
     // instruction index by byte offset, for branch targets
     let index_of: std::collections::HashMap<usize, usize> =
         insts.iter().enumerate().map(|(n, i)| (i.offset, n)).collect();
+    let title_far = title_far_jumps(&insts, &index_of)?;
+    // (the four instructions of each: written as they are, the offset again at the end)
+    let title_far_parts: std::collections::HashSet<usize> =
+        title_far.iter().flat_map(|(&getpc, &(_, add, _))| [getpc, add, add + 1, add + 2]).collect();
     let targets: std::collections::HashSet<usize> = insts
         .iter()
         .filter_map(branch_target)
+        .chain(title_far.values().map(|&(t, _, _)| insts[t].offset))
         .collect();
     let mut starts = Vec::with_capacity(insts.len());
-    // (word of a branch in `out`, the instruction index it goes to)
-    let mut fixups: Vec<(usize, usize)> = Vec::new();
+    // (word of a branch in `out`, the instruction index it goes to, the branch's index)
+    let mut fixups: Vec<(usize, usize, usize)> = Vec::new();
+    // far jumps of the rewrite's own ([`far_jump`])
+    let mut far_fixups: Vec<(usize, usize, usize, usize)> = Vec::new();
+    // the program's own far jumps: (word of the getpc, word of the literal, target, subtracts)
+    let mut title_fixups: Vec<(usize, usize, usize, bool)> = Vec::new();
     for (n, i) in insts.iter().enumerate() {
         if targets.contains(&i.offset) {
             out.real = None;
         }
         starts.push(out.words.len());
         let name = i.name().unwrap_or("");
+        if title_far_parts.contains(&n) {
+            if let Some(&(t, _, sub)) = title_far.get(&n) {
+                // the add's literal is its second word, after the getpc's one
+                title_fixups.push((out.words.len(), out.words.len() + 2, t, sub));
+            }
+            out.push(&i.words);
+            if name == "s_setpc_b64" {
+                out.real = None;
+            }
+            continue;
+        }
         match i.encoding {
             Encoding::Sop1 | Encoding::Sop2 | Encoding::Sopc | Encoding::Sopk => scalar(&mut out, &r, i, name)?,
             Encoding::Smem => out.push(&i.words),
@@ -251,17 +355,36 @@ fn rewrite(native: &NativeProgram) -> Result<NativeProgram, Why> {
                         any_lane(&mut out, &r, pair)?;
                         let (_, t) = (0, target.ok_or("dual-bank: a branch without a target")?);
                         let to = if name.ends_with("nz") { "s_cbranch_execnz" } else { "s_cbranch_execz" };
-                        let o = op(Encoding::Sopp, to)?;
-                        fixups.push((out.words.len(), t));
-                        out.push(&[0xBF80_0000 | o << 16]);
+                        if far.contains(&n) {
+                            // the opposite branch over a far jump
+                            let opposite = if name.ends_with("nz") { "s_cbranch_execz" } else { "s_cbranch_execnz" };
+                            let o = op(Encoding::Sopp, opposite)?;
+                            out.push(&[0xBF80_0000 | o << 16 | FAR_JUMP_WORDS]);
+                            far_jump(&mut out, &r, t, &mut far_fixups)?;
+                        } else {
+                            let o = op(Encoding::Sopp, to)?;
+                            fixups.push((out.words.len(), t, n));
+                            out.push(&[0xBF80_0000 | o << 16]);
+                        }
                     }
                     n if n.starts_with("s_cbranch_cdbg") || n == "s_setkill" => return Err("dual-bank: a debug or kill branch"),
-                    _ => {
-                        if let Some(t) = target {
-                            fixups.push((out.words.len(), t));
+                    _ => match target {
+                        Some(t) if far.contains(&n) => match name {
+                            "s_branch" => far_jump(&mut out, &r, t, &mut far_fixups)?,
+                            "s_cbranch_scc0" | "s_cbranch_scc1" => {
+                                let opposite = if name == "s_cbranch_scc0" { "s_cbranch_scc1" } else { "s_cbranch_scc0" };
+                                let o = op(Encoding::Sopp, opposite)?;
+                                out.push(&[0xBF80_0000 | o << 16 | FAR_JUMP_WORDS]);
+                                far_jump(&mut out, &r, t, &mut far_fixups)?;
+                            }
+                            _ => return Err("dual-bank: a branch too far after the rewrite, of a kind not made far"),
+                        },
+                        Some(t) => {
+                            fixups.push((out.words.len(), t, n));
+                            out.push(&i.words);
                         }
-                        out.push(&i.words);
-                    }
+                        None => out.push(&i.words),
+                    },
                 }
                 if target.is_some() {
                     out.real = None;
@@ -313,10 +436,27 @@ fn rewrite(native: &NativeProgram) -> Result<NativeProgram, Why> {
         }
     }
     // branch offsets in dwords from the word after the branch
-    for (at, t) in fixups {
+    for (at, t, n) in fixups {
         let to = starts[t] as i64 - (at as i64 + 1);
-        let imm = i16::try_from(to).map_err(|_| "dual-bank: a branch too far after the rewrite")?;
-        out.words[at] = out.words[at] & 0xFFFF_0000 | u32::from(imm as u16);
+        match i16::try_from(to) {
+            Ok(imm) => out.words[at] = out.words[at] & 0xFFFF_0000 | u32::from(imm as u16),
+            Err(_) => out_of_reach.push(n),
+        }
+    }
+    if !out_of_reach.is_empty() {
+        return Err(TOO_FAR);
+    }
+    // far jumps: bytes from the instruction after the getpc
+    let offset = |getpc: usize, t: usize| 4 * starts[t] as i64 - 4 * (getpc as i64 + 1);
+    for (getpc, literal, t, sub) in title_fixups {
+        let delta = offset(getpc, t);
+        out.words[literal] = (if sub { -delta } else { delta }) as i32 as u32;
+    }
+    for (getpc, literal, carry, t) in far_fixups {
+        let delta = offset(getpc, t);
+        out.words[literal] = delta as i32 as u32;
+        let high = if delta < 0 { MINUS_ONE } else { int(0) };
+        out.words[carry] = out.words[carry] & !0xFF00 | high << 8;
     }
     let host = group.div_ceil(64) * 32;
     Ok(NativeProgram {
@@ -1027,7 +1167,7 @@ fn dump_rewrite_around() {
     let c = crate::Container::parse(&bytes).expect("container");
     let part = c.part(crate::FourCC::DXIL).expect("DXIL part");
     let native = crate::native_programs(part.data).expect("programs").into_iter().find(|p| p.stage == HwStage::Cs).expect("compute");
-    let dual = rewrite(&native).expect("rewrite");
+    let dual = transform(&native).expect("rewrite");
     for i in gfx10::decode(&dual.code).expect("decode") {
         if i.offset + 0x80 >= at && i.offset <= at + 0x40 {
             println!("{:#06x}{} {}", i.offset, if i.offset == at { " >>" } else { "   " }, i.text(false));
