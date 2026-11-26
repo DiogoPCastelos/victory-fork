@@ -6638,6 +6638,22 @@ impl HostList {
         }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
+            // Diagnostics: what the list held (with `VICTORY_D3D12_DRED=1`
+            // its operations are noted), and the PC's memory then.
+            #[cfg(feature = "diagnostics")]
+            {
+                let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+                let (phys, commit) = crate::copystat::system_memory();
+                tracing::error!(
+                    ops = notes.len(),
+                    free_mb = phys >> 20,
+                    commit_left_mb = commit >> 20,
+                    "the list that did not close: its noted operations, the last 40 below"
+                );
+                for (k, (what, _)) in notes.iter().enumerate().skip(notes.len().saturating_sub(40)) {
+                    tracing::error!(k, "  {what}");
+                }
+            }
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));

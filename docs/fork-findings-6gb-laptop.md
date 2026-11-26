@@ -254,6 +254,43 @@ changed (every compute path count in the census is unchanged).
   async calls, loader, samplers, formats, tools). One VIctory test for HDR
   captures was left out: our captures do not have the code it tests.
 
+### The builder on this machine (2026-11-26, night)
+
+World runs with `VICTORY_BVH_BUILDER=1`, after the thread-count fixes (the
+box stages' threads past a `DispatchX` count now write nothing, also in the
+paired and halves forms):
+
+- No more crashes in the title's own code on box-node data (before the
+  fixes: 16-bit infinities read as pointers, 1 to 20 s after the builder
+  started).
+- Every run ended out of memory 5 to 18 s after the builder started (a host
+  list that did not close, a card copy that could not be recorded), with
+  0.5 to 2 GB of commit left. The world alone climbs to 21.6-21.8 GB private
+  here (0.4-0.5 GB of commit left, builder off, the same in a run of the
+  early morning and one at night); the builder starts on the world's first
+  frame and adds about 1 GB. Not enough room on 16 GB of RAM; testers with
+  28 GB and more are not at this edge.
+- `VICTORY_INPLACE=1` now also makes the title's physical pages committed
+  sections of 32 MiB and places a window that is one run of a section in that
+  section's heap (opened once, at most 1 GB of sections,
+  `VICTORY_INPLACE_SECTIONS_MB`). In the world it placed nothing: the
+  windows span pages of more than one section. Private memory in place
+  (`VICTORY_INPLACE_PRIVATE=1`, now off by default) ended two builder runs in
+  the card's driver (`nvwgf2umx.dll`, an access violation) within seconds;
+  without it, no such end. A buffer in a section heap takes every state the
+  layer uses (a card test).
+- 1 MiB windows (`VICTORY_WINDOW_KB=1024 VICTORY_WINDOW_TAILS=1`): the
+  windows' unasked bytes fell from 1.5 GB to 3 MB; the builder lasted 13 s
+  against 6 s; still out of memory.
+- Title memory by address (`memory.rs`, the builder's only): a page that
+  faults now brings the rest of its region, up to 16 MiB, at once; a list
+  declares written (a CPU compare after it) only the copies its dispatches
+  name, those shaders reached by pointers and new ones, not every copy; a
+  copy nothing names for 30 s (`VICTORY_RAW_IDLE_MS`) and no pointer reached
+  is let go. Not yet measured in a run where the builder lives long enough.
+- With the builder off, a world run on the same build: the static world lit
+  by the walkers, no error until closed in the open world.
+
 Translated but refused by `dxil.dll`'s validator (the driver takes them all):
 216 programs, 111 vertex/pixel and 105 mesh. 71 mesh programs output more
 than 32 KB; 72 have an input or output signature not as the module expects;

@@ -66,8 +66,13 @@ struct Memory {
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
     faults: (ID3D12Resource, *mut u32, u64),
-    /// Copy `n` is `copies[n - 1]`.
-    copies: Vec<Arc<Shadow>>,
+    /// Copy `n` is `copies[n - 1]`; `None`: a number let go, free for reuse.
+    copies: Vec<Option<Numbered>>,
+    /// Numbers let go ([`Memory::let_go_idle`]), taken again first.
+    free: Vec<usize>,
+    /// Numbers given since the last [`ready`] took them: brought up to date
+    /// and declared written by the list that numbered them.
+    fresh: Vec<usize>,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -75,7 +80,32 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// Since the start: copies let go, and their bytes; copies declared
+    /// written by lists (each a CPU compare after the list).
+    stats: [u64; 3],
 }
+
+/// A numbered copy.
+struct Numbered {
+    shadow: Arc<Shadow>,
+    /// When a dispatch's arguments last named it (`crate::host::now_ms`).
+    used: u64,
+    /// Reached by a shader through a pointer it read out of memory (a page
+    /// of it faulted): such a copy is declared written by every list that
+    /// stores, and never let go.
+    pointer: bool,
+}
+
+/// How long a copy no dispatch names, and no shader reached by a pointer,
+/// is kept (`VICTORY_RAW_IDLE_MS`, 30 s).
+fn idle_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| std::env::var("VICTORY_RAW_IDLE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(30_000))
+}
+
+/// The most bytes made ready around a page that faulted, half before and
+/// half after it, inside its region of the address space.
+const AROUND_FAULT: u64 = 16 << 20;
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
 // the mutex.
@@ -108,55 +138,159 @@ impl Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
             copies: Vec::new(),
+            free: Vec::new(),
+            fresh: Vec::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            stats: [0; 3],
         })
     }
 
+    /// Lets go of copies no dispatch has named for [`idle_ms`] and no shader
+    /// reached by a pointer: their directory entries are emptied (a page
+    /// touched again faults and is copied anew the next frame), the number
+    /// is free, and the copy goes when nothing else holds it. At most 64 a
+    /// frame.
+    fn let_go_idle(&mut self) {
+        let now = crate::host::now_ms();
+        let idle = idle_ms();
+        let mut went = 0;
+        for n in 0..self.copies.len() {
+            if went >= 64 {
+                break;
+            }
+            let Some(c) = &self.copies[n] else { continue };
+            if c.pointer || now < c.used + idle {
+                continue;
+            }
+            let (first, len) = c.shadow.span();
+            let mut at = first & !(PAGE - 1);
+            while at < first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
+                // SAFETY: inside the directory's mapping.
+                let entry = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
+                // SAFETY: as above; the number first, so a shader sees the
+                // page empty before its offset changes.
+                unsafe {
+                    if entry.read() == n as u32 + 1 {
+                        entry.write_volatile(0);
+                    }
+                }
+                at += PAGE;
+            }
+            self.stats[0] += 1;
+            self.stats[1] += len;
+            self.copies[n] = None;
+            self.free.push(n);
+            went += 1;
+        }
+    }
+
+    /// The number of a newly numbered copy: a free one (every heap's run
+    /// then writes that slot's view again), else the next.
+    fn number(&mut self, shadow: Arc<Shadow>, pointer: bool) -> Option<usize> {
+        let numbered = Numbered { shadow, used: crate::host::now_ms(), pointer };
+        if let Some(n) = self.free.pop() {
+            self.copies[n] = Some(numbered);
+            for run in self.heaps.values_mut() {
+                run.1 = run.1.min(n as u32);
+            }
+            self.fresh.push(n);
+            return Some(n);
+        }
+        if self.copies.len() >= COPIES as usize {
+            return None;
+        }
+        self.copies.push(Some(numbered));
+        self.fresh.push(self.copies.len() - 1);
+        Some(self.copies.len() - 1)
+    }
+
+    /// The line of the copies, every ten seconds.
+    fn say(&self) {
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = crate::host::now_ms();
+        if now < LAST.load(std::sync::atomic::Ordering::Relaxed) + 10_000 {
+            return;
+        }
+        LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+        let (n, bytes, pointer) = self.census();
+        tracing::info!(
+            "title memory by address: {n} copies numbered now ({} MB), {pointer} of them reached by pointers; since the start {} let go ({} MB) after {} ms with nothing naming them, {} declared written by lists",
+            bytes >> 20,
+            self.stats[0],
+            self.stats[1] >> 20,
+            idle_ms(),
+            self.stats[2]
+        );
+    }
+
+    /// The live copies' count and bytes, and how many are reached by
+    /// pointers.
+    fn census(&self) -> (usize, u64, usize) {
+        let live = self.copies.iter().flatten();
+        let (mut n, mut bytes, mut pointer) = (0, 0, 0);
+        for c in live {
+            n += 1;
+            bytes += c.shadow.span().1;
+            pointer += usize::from(c.pointer);
+        }
+        (n, bytes, pointer)
+    }
+
     /// Gives the page of `address` its copy, if it has none and the memory
-    /// is the title's.
-    fn map(&mut self, address: u64) {
+    /// is the title's; the copy's number, marked used now (`pointer`: a
+    /// shader reached it through a pointer).
+    fn map(&mut self, address: u64, pointer: bool) -> Option<usize> {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
         if page >= u64::from(MEMORY_PAGES) - 1 {
-            return;
+            return None;
         }
         // SAFETY: inside the directory's mapping.
         let entry = unsafe { self.directory.1.add(page as usize * 2) };
         // SAFETY: as above.
-        if unsafe { entry.read() } != 0 {
-            return;
+        let held = unsafe { entry.read() };
+        if held != 0 {
+            let n = held as usize - 1;
+            if let Some(Some(c)) = self.copies.get_mut(n) {
+                c.used = crate::host::now_ms();
+                c.pointer |= pointer;
+            }
+            return Some(n);
         }
         let start = page * PAGE;
         // A shader's pointer, or a constant taken for an address, may be
         // anything: only memory the title has.
         if self.refused.contains(&page) {
-            return;
+            return None;
         }
         if !crate::texture::committed(start as *const u8, PAGE as usize) {
             self.refused.insert(page);
-            return;
+            return None;
         }
         // The copy a root view at that address would get; a buffer that
         // ends inside the page is passed over for what holds all of it.
         let whole = |s: &Arc<Shadow>| s.offset_in(start).is_some_and(|_| s.left(start) >= PAGE);
-        let Some(shadow) = crate::shadow::find(start, 1)
+        let shadow = crate::shadow::find(start, 1)
             .filter(whole)
-            .or_else(|| crate::shadow::find(start, PAGE).filter(whole))
-        else {
-            return;
-        };
+            .or_else(|| crate::shadow::find(start, PAGE).filter(whole))?;
         // SAFETY: a live buffer.
         let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-            return;
+            return None;
         }
-        let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
-            Some(n) => n,
-            None if self.copies.len() < COPIES as usize => {
-                self.copies.push(shadow.clone());
-                let n = self.copies.len() - 1;
+        let known = self.copies.iter().position(|c| c.as_ref().is_some_and(|c| Arc::ptr_eq(&c.shadow, &shadow)));
+        let n = match known {
+            Some(n) => {
+                if let Some(Some(c)) = self.copies.get_mut(n) {
+                    c.used = crate::host::now_ms();
+                    c.pointer |= pointer;
+                }
+                n
+            }
+            None => match self.number(shadow.clone(), pointer) {
+                Some(n) => {
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
                 // shortcut: a page of a title buffer inside this one that
@@ -180,14 +314,15 @@ impl Memory {
                     at += PAGE;
                 }
                 n
-            }
-            None => {
-                static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| {
-                    tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
-                });
-                return;
-            }
+                }
+                None => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
+                    });
+                    return None;
+                }
+            },
         };
         // In the buffer (`Shadow::offset`: past the bytes before the title
         // memory in a copy in place).
@@ -198,6 +333,7 @@ impl Memory {
             entry.add(1).write_volatile(offset as u32);
             entry.write_volatile(n as u32 + 1);
         }
+        Some(n)
     }
 
     /// The pages shaders found empty since the last frame.
@@ -230,9 +366,23 @@ impl Memory {
         // an address nothing holds (a wild pointer, or a bad offset).
         let mut wild = Vec::new();
         for page in pages {
-            self.map(u64::from(page) * PAGE);
+            let at = u64::from(page) * PAGE;
+            self.map(at, true);
             if self.refused.contains(&u64::from(page)) {
-                wild.push(u64::from(page) * PAGE);
+                wild.push(at);
+                continue;
+            }
+            // What lies around it in the same region is likely reached the
+            // same way (a structure's nodes after its header): made ready now
+            // too, up to `AROUND_FAULT`, so it does not fault a frame later.
+            if let Some((region, end)) = region_of(at) {
+                let from = at.saturating_sub(AROUND_FAULT / 2).max(region) & !(CELL - 1);
+                let to = (at + AROUND_FAULT / 2).min(end);
+                let mut cell = from;
+                while cell < to {
+                    self.map(cell.max(region), true);
+                    cell += CELL;
+                }
             }
         }
         if !wild.is_empty() {
@@ -250,11 +400,22 @@ impl Memory {
     }
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
-    /// after it.
-    fn name(&mut self, address: u64) {
-        self.map(address);
-        self.map((address & !(CELL - 1)) + CELL);
+    /// after it; their numbers go into `named`.
+    fn name(&mut self, address: u64, named: &mut Vec<usize>) {
+        named.extend(self.map(address, false));
+        named.extend(self.map((address & !(CELL - 1)) + CELL, false));
     }
+}
+
+/// The region of the address space `at` lies in (same allocation state and
+/// protection, from Windows), as `[start, end)`.
+fn region_of(at: u64) -> Option<(u64, u64)> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data the call fills in.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const std::ffi::c_void, &mut info, size_of_val(&info)) };
+    (n != 0 && info.State == MEM_COMMIT).then(|| (info.BaseAddress as u64, info.BaseAddress as u64 + info.RegionSize as u64))
 }
 
 /// Before a draw whose shader reads title memory by address: what its
@@ -280,10 +441,12 @@ pub(crate) fn ready(
         m.frame = frame;
         m.refused.clear();
         m.take_faults();
+        m.let_go_idle();
+        m.say();
     }
-    let numbered = m.copies.len();
+    let mut named = Vec::new();
     for &address in addresses {
-        m.name(address);
+        m.name(address, &mut named);
     }
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units. A constant that only looks like one names
@@ -293,12 +456,13 @@ pub(crate) fn ready(
             && (1..=0xFF).contains(&high)
             && c >= 0x1_0000
         {
-            m.name(u64::from(c) | u64::from(high) << 32);
+            m.name(u64::from(c) | u64::from(high) << 32, &mut named);
         }
         if c >= 0x0100_0000 {
-            m.name(u64::from(c) << 8);
+            m.name(u64::from(c) << 8, &mut named);
         }
     }
+    let fresh = std::mem::take(&mut m.fresh);
     let key = std::ptr::from_ref(heap) as usize;
     let (base, made) = match m.heaps.get(&key) {
         Some(&run) => run,
@@ -309,30 +473,46 @@ pub(crate) fn ready(
             (base, 0)
         }
     };
-    for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (first, len) = shadow.span();
-        // The whole buffer the directory's offsets count in, the bytes
-        // before the title memory of a copy in place included.
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len + shadow.offset(first));
+    for (n, slot) in m.copies.iter().enumerate().skip(made as usize) {
+        match slot {
+            Some(c) => {
+                let (first, len) = c.shadow.span();
+                // The whole buffer the directory's offsets count in, the bytes
+                // before the title memory of a copy in place included.
+                heap.raw_uav_at(base + 1 + n as u32, &c.shadow.buffer, 0, len + c.shadow.offset(first));
+            }
+            // A number let go: its pages are empty in the directory.
+            None => heap.null_raw_uav_at(base + 1 + n as u32),
+        }
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
-    // Once per list, and for copies numbered since: the builder alone
-    // dispatches hundreds of times a frame.
+    // Brought up to date once per list (every live copy: a shader may read
+    // any of them through a pointer), and copies numbered since. Declared
+    // written (each a CPU compare after the list) only where a store can
+    // land: copies this list's dispatches name, copies shaders reached by
+    // pointers, and copies numbered since. Before, every numbered copy was
+    // declared by every list that stores.
     // shortcut: a copy another list numbers meanwhile is brought up to date
     // by that list's submission, which may run after this one's.
     const READ: usize = usize::MAX - 0x6d;
-    const WRITE: usize = usize::MAX - 0x6e;
+    /// Per copy `n`, `WRITTEN - n`: declared written in this list.
+    const WRITTEN: usize = usize::MAX - 0x1_0000;
     let first_read = list.first_use(READ);
-    let first_write = writes && list.first_use(WRITE);
-    for (n, shadow) in m.copies.iter().enumerate() {
-        let (start, len) = shadow.span();
-        if first_read || n >= numbered {
-            shadow.refresh(list, start, len);
+    let mut declared = 0;
+    for (n, slot) in m.copies.iter().enumerate() {
+        let Some(c) = slot else { continue };
+        let (start, len) = c.shadow.span();
+        let new = fresh.contains(&n);
+        if first_read || new {
+            c.shadow.refresh(list, start, len);
         }
-        if writes && (first_write || n >= numbered) {
-            shadow.gpu_writes(list, start, len);
+        let reached = new || c.pointer || named.contains(&n);
+        if writes && reached && list.first_use(WRITTEN - n) {
+            c.shadow.gpu_writes(list, start, len);
+            declared += 1;
         }
     }
+    m.stats[2] += declared;
     if first_read {
         list.keep(&m.directory.0);
         list.keep(&m.faults.0);
