@@ -557,6 +557,65 @@ pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
 }
 
+/// How long a host list whose recording ran out of memory is recorded
+/// again before the run ends ([`retry_out_of_memory`]): the waits and the
+/// pause between two tries. `VICTORY_OOM_RETRY_MS` (10,000; 0: the first
+/// failure ends the run, as before).
+fn oom_retry() -> (u32, std::time::Duration) {
+    static MS: OnceLock<u64> = OnceLock::new();
+    let ms = *MS.get_or_init(|| {
+        std::env::var("VICTORY_OOM_RETRY_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(10_000)
+    });
+    const PAUSE_MS: u64 = 100;
+    ((ms / PAUSE_MS) as u32, std::time::Duration::from_millis(PAUSE_MS))
+}
+
+/// Runs `record` once, and again up to `waits` times, `pause` apart, while
+/// it fails with E_OUTOFMEMORY; any other result is returned as it is.
+///
+/// For a host list that is reset, recorded, closed and only then submitted,
+/// so that a failure leaves nothing on the queue and recording it again from
+/// its reset is safe. On a 16 GB machine a world run sits at 0.4-2 GB of the
+/// system's commit left (`docs/fork-findings-6gb-laptop.md`), and one run
+/// ended because closing the list that brings card copies up to date failed
+/// with E_OUTOFMEMORY: the commit was used up for a moment, while the page
+/// file can still grow and the layer's sweep lets idle copies go. A list
+/// that fails for seconds still ends the run.
+fn retry_out_of_memory(
+    what: &str,
+    waits: u32,
+    pause: std::time::Duration,
+    mut record: impl FnMut() -> windows::core::Result<()>,
+) -> windows::core::Result<()> {
+    let mut waited = 0;
+    loop {
+        match record() {
+            Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY && waited < waits => {
+                if waited == 0 {
+                    tracing::warn!(
+                        commit_left_mb = available_commit().unwrap_or(0) >> 20,
+                        "{what}: out of memory; recorded again for up to {} ms (VICTORY_OOM_RETRY_MS)",
+                        u128::from(waits) * pause.as_millis()
+                    );
+                }
+                OOM_RETRIES.fetch_add(1, Ordering::Relaxed);
+                waited += 1;
+                std::thread::sleep(pause);
+            }
+            done => {
+                if waited > 0 && done.is_ok() {
+                    tracing::warn!("{what}: recorded after {waited} tries out of memory");
+                }
+                return done;
+            }
+        }
+    }
+}
+
+/// Tries of host lists recorded again for want of memory, since the start
+/// ([`retry_out_of_memory`]).
+pub(crate) static OOM_RETRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Ends the run on a host GPU failure: what failed, the removal reason and
 /// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
 /// diagnostics build names the command).
@@ -749,6 +808,53 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
             ));
         }
         Ok(adapter)
+    }
+}
+
+#[cfg(test)]
+mod oom_retry_tests {
+    use super::retry_out_of_memory;
+    use std::time::Duration;
+    use windows::Win32::Foundation::{E_FAIL, E_OUTOFMEMORY};
+
+    /// A recording that fails `fails` times with `code`, then succeeds;
+    /// counts its tries.
+    fn failing(fails: u32, code: windows::core::HRESULT, tries: &mut u32) -> windows::core::Result<()> {
+        *tries += 1;
+        if *tries <= fails { Err(code.into()) } else { Ok(()) }
+    }
+
+    #[test]
+    fn out_of_memory_is_recorded_again_until_it_succeeds() {
+        let mut tries = 0;
+        let done = retry_out_of_memory("test", 5, Duration::ZERO, || failing(3, E_OUTOFMEMORY, &mut tries));
+        assert!(done.is_ok());
+        assert_eq!(tries, 4);
+    }
+
+    #[test]
+    fn out_of_memory_past_the_waits_is_returned() {
+        let mut tries = 0;
+        let done = retry_out_of_memory("test", 2, Duration::ZERO, || failing(10, E_OUTOFMEMORY, &mut tries));
+        assert_eq!(done.unwrap_err().code(), E_OUTOFMEMORY);
+        // The first try and two more.
+        assert_eq!(tries, 3);
+    }
+
+    #[test]
+    fn other_failures_are_not_recorded_again() {
+        let mut tries = 0;
+        let done = retry_out_of_memory("test", 5, Duration::ZERO, || failing(1, E_FAIL, &mut tries));
+        assert_eq!(done.unwrap_err().code(), E_FAIL);
+        assert_eq!(tries, 1);
+    }
+
+    #[test]
+    fn no_waits_fails_at_once_as_before() {
+        let mut tries = 0;
+        let done = retry_out_of_memory("test", 0, Duration::ZERO, || failing(1, E_OUTOFMEMORY, &mut tries));
+        assert_eq!(done.unwrap_err().code(), E_OUTOFMEMORY);
+        assert_eq!(tries, 1);
     }
 }
 
@@ -4198,10 +4304,14 @@ impl Host {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
             let (allocator, list) = &sync;
+            // Recorded again while it runs out of memory: nothing reaches the
+            // queue before the list has closed (`retry_out_of_memory`). The
+            // per-frame counters below then count the ranges more than once.
+            let (waits, pause) = oom_retry();
             // SAFETY: the list's last run finished (it ran ahead of a
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
-            let recorded = unsafe {
+            let recorded = retry_out_of_memory("the list that brings card copies up to date", waits, pause, || unsafe {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
@@ -4259,10 +4369,11 @@ impl Host {
                     }
                     crate::cardmeter::end(list, timed);
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    let list = list.cast()?;
+                    self.queue.ExecuteCommandLists(&[Some(list)]);
                     Ok(())
                 })()
-            };
+            });
             if let Err(e) = recorded {
                 fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"));
             }

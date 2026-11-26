@@ -155,6 +155,9 @@ pub(crate) struct Shader {
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
+    /// A pixel shader whose console program orders overlapping pixels (POPS): every UAV
+    /// it reads or writes is rasterizer ordered, the host's way of the same ordering.
+    pub rov: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
@@ -212,6 +215,7 @@ impl Shader {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             flags: 0,
+            rov: false,
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
@@ -380,6 +384,13 @@ impl Shader {
     }
 
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
+        // (bit 12: a UAV; bit 13: rasterizer ordered. No ROV shader flag: the validator counts
+        // none for heap handles, and refuses the module with it.)
+        let props0 = if self.rov && props0 & 0x1000 != 0 {
+            props0 | 0x2000
+        } else {
+            props0
+        };
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
         self.op(

@@ -29,7 +29,12 @@ target\release\victory.exe run <game dir>\<the title's exe> --execute
 Warming (upstream's `translate --warm`) translates every shader container
 into the cache a run reads; the whole pack (26,503 containers) takes about
 2.5 minutes here. The cache is keyed on the translator's source, so a build
-that does not touch the translator starts warm. The translation has to be
+that does not touch the translator starts warm. The key also holds the build
+kind (`translation_fingerprint`: the `diagnostics` feature and debug
+assertions), so a diagnostics build (`cargo build --profile diag -p victory
+--features diagnostics`) has a cache of its own: warm it with the binary that
+runs. A new key also means the driver's pipelines are made again at the next
+run's start (about 1,100 here, minutes of menus while they are made). The translation has to be
 the one a run on this GPU makes: its wave width and view-heap limit, which
 a run's log gives ("host wave lanes ... max=32"; "host view heaps hold
 1000000 views", whose last slot, 999999, is the limit). This branch had
@@ -224,6 +229,72 @@ busy) and holds 24-30 fps once they are done. A start-up cost only.
 - Later launches stopped at the title's start screen until a key was
   pressed (earlier ones had someone at the keyboard): unattended runs need
   `VICTORY_KEYS` (diagnostics builds), e.g. Enter every 15-30 s from 45 s.
+- When the keys let the opening cinematic play to its end instead of
+  skipping it, the title faulted in its own code (a write to address 0) at
+  the cinematic's lead-out, 4-8 minutes in, twice in two such runs with two
+  different settings; runs whose keys skipped it reached the world. Not
+  looked into yet.
+
+## Memory on a 16 GB machine (with upstream's frame-rate work)
+
+The same machine, later, with this branch on top of upstream's frame-rate
+work (card copies of title buffers at 1 MiB and up, draw windows, the relay,
+copy queues; all their defaults). Runs crashed with E_OUTOFMEMORY while card
+copies were brought up to date, once with an access violation in the NVIDIA
+driver. Measured in 10-minute world runs of a diagnostics build, the same
+key script, one game at a time, with a sampler of the process's private
+bytes, the system's commit and the card's memory every 5 s:
+
+| | This branch | The branch without upstream's frame-rate work |
+|---|---|---|
+| private bytes in the world | 20-22 GB | 20-21 GB |
+| commit left in the world (limit 40.7 GB) | 0.4-2 GB | 0.7-1.7 GB |
+| windows outside buffers (host copies) | 3.2 GB | 3.2 GB |
+| host textures | 5.3 GB | 5.5 GB |
+| card copies of title buffers, at the end | 59, 0.6 GB | 23, 0.4 GB |
+| the card | 6.4-6.6 GB of a 5.2 GB budget, 4.6-6.7 GB of shared memory | the same |
+| world frames (1,000+ draws), mean | 0.57 fps; 1,058 ms preparing, 514 ms GPU, 1,201 ms copying back 65 MB | 0.76 fps; 722, 505, 973 ms for 70 MB |
+
+So upstream's work adds about 0.5 GB here and the older branch is at the
+same edge: from the world's first frame both have 1-2 GB of commit left.
+Whether a run survives depends on what else holds commit (about 13 GB with
+nothing running; a shader translate or validate beside the game takes
+0.5-4 GB more) and on the page file growing in time (here 24 GB, at most
+32 GB). Where the process's commit goes (the layer's memory map line): the
+title's heaps 4.6 GB and its page pool 6.2 GB (a section, outside private
+bytes); buffers shared with the card about 7.5 GB; the windows 2-3 GB; other
+allocations 5.8 GB, among them four driver regions of 1 GB (2.7 GB
+committed).
+
+The copying is slow because the memory is not there: the process's working
+set is 0.5-3 GB of 22 GB and the PC has under 1 GB free, so 65-77 MB copied
+back a frame take 0.7-1.2 s (60-100 MB/s). The GPU's time per frame is the
+same in all three runs (about 505 ms). On this machine memory is the frame
+rate too.
+
+What was looked at and what it gave:
+
+- `VICTORY_TEXTURE_SPILL_COMMIT_MB` never fires in the world: the card is
+  past its share and the shared memory holds more than half of its budget
+  from the first frames, so the spill's own rule refuses first. The spill
+  does not use the commit up.
+- The thousands of drops a frame on the frame line are the ray-tracing
+  builder's stages (off by default: 610-2,570 a frame), not draws; the
+  rest is about one dispatch a frame for each of a few refused compute
+  pipelines. The pipeline workers' pause at low commit cost 2-3 a frame.
+- `VICTORY_WINDOW_KB=1024 VICTORY_WINDOW_TAILS=1` (only 2.0-2.1 GB of the
+  windows' 3.2 GB was ever copied) and `VICTORY_CARD_BUFFERS_MB=512`: not
+  measured in the world. Their runs played the opening cinematic and met
+  the title's fault above, or were still in it after 10 minutes.
+- Not tried: `VICTORY_INPLACE=1` would drop the windows' copies but locks
+  the title's pages into RAM (up to 4 GB), which this machine does not
+  have free.
+
+What keeps a run alive here, by what was measured: a larger page file (the
+commit limit is the edge; the page file's peak use since boot was 7.9 GB, so
+the room costs disk, not RAM), and no translate, validate or build beside a
+game run. What would make it faster is less memory touched per frame, the
+windows first.
 
 ## XCL
 

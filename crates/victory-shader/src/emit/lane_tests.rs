@@ -220,11 +220,39 @@ fn card(what: &str, body: &[u32]) -> Option<Card> {
 
 /// [`card`] for a group of `threads` threads (console waves of 64, the last one partial).
 fn card_of(what: &str, body: &[u32], threads: u32) -> Option<Card> {
-    let native = native_of(body, true, threads);
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let wide = lowered_on(&native, &p, &HashSet::new(), 64).expect("lowered for 64-lane waves");
-    validate(&wide);
-    let shader = lowered(&native, &p, &HashSet::new()).unwrap_or_else(|e| panic!("{what}: not lowered for 32-lane waves: {e}"));
+    card_with(what, body, |n| {
+        if let crate::native::StageIo::Cs(cs) = &mut n.io {
+            cs.threads = [threads, 1, 1];
+        }
+    })
+}
+
+/// [`card`] for a program as `adjust` changes it (group shape, thread-id VGPRs).
+fn card_with(what: &str, body: &[u32], adjust: impl FnOnce(&mut crate::native::NativeProgram)) -> Option<Card> {
+    let mut console = native_of(body, true, 64);
+    adjust(&mut console);
+    let threads = match &console.io {
+        crate::native::StageIo::Cs(cs) => cs.threads.iter().product::<u32>(),
+        _ => 64,
+    };
+    let dual = DUAL.get();
+    let what = &if dual { format!("{what} [dual-bank]") } else { what.to_owned() };
+    let (native, shader) = if dual {
+        // one host wave of 32 per console wave, two console lanes per host lane
+        let native = crate::dualbank::transform(&console).unwrap_or_else(|e| panic!("{what}: not rewritten: {e}"));
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap_or_else(|e| panic!("{what}: ir::build: {e}"));
+        let shader = lower::with_dual_bank(|| lowered(&native, &p, &HashSet::new()))
+            .unwrap_or_else(|e| panic!("{what}: not lowered: {e}"));
+        (native, shader)
+    } else {
+        let p = ir::build(&console.code, console.wave64, console.vgprs).expect("ir::build");
+        let wide = lowered_on(&console, &p, &HashSet::new(), 64).expect("lowered for 64-lane waves");
+        validate(&wide);
+        let shader = lowered(&console, &p, &HashSet::new())
+            .unwrap_or_else(|e| panic!("{what}: not lowered for 32-lane waves: {e}"));
+        (console, shader)
+    };
+    let _ = &native;
     let form = lower::last_form();
     validate(&shader);
     let host = match Host::new(false) {
@@ -273,6 +301,144 @@ impl Card {
             .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
         out.swap_remove(0)
     }
+
+    /// GPU milliseconds of a dispatch of `groups` thread groups (timestamps around the
+    /// dispatch, `host::GPU_MS`): the median of `reps` after one warm-up.
+    fn time(&self, s: [u32; 4], groups: u32, reps: usize) -> f64 {
+        let mut ud = vec![0u32; self.shader.user_data_dwords().max(1) as usize];
+        for u in &self.shader.user_data {
+            if let (RootType::Constants, 0, d @ 0..=3) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = s[d as usize];
+            }
+        }
+        let mut once = || {
+            self.host
+                .dispatch(
+                    &self.root,
+                    &self.pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud.clone()))],
+                        views: &[View::RawUav(self.threads.max(64))],
+                        samplers: &[],
+                        groups: [groups, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+            super::host::GPU_MS.get()
+        };
+        once();
+        let mut ms: Vec<f64> = (0..reps).map(|_| once()).collect();
+        ms.sort_by(f64::total_cmp);
+        ms[reps / 2]
+    }
+}
+
+/// Paired waves against dual-bank on the hardware device (the handover's §12 benchmarks;
+/// CLAUDE.md: measure both before choosing defaults). Each workload is one console wave's
+/// straight-line program, dispatched as 65,535 groups (4 million console threads); the time
+/// of an empty program (the store alone) is subtracted, so what is left is the workload's
+/// GPU time plus noise. Ignored by default: `cargo test -p victory-shader --lib
+/// bench_paired_against_dual_bank -- --ignored --nocapture --test-threads=1`.
+#[test]
+#[ignore = "a benchmark: run it on purpose"]
+fn bench_paired_against_dual_bank() {
+    const GROUPS: u32 = 65_535;
+    const REPS: usize = 5;
+    const N: usize = 128;
+    let body = |inner: &dyn Fn(&mut Vec<u32>)| {
+        let mut w = prologue();
+        w.extend([
+            vop2(V_XOR_B32, 2, 0, 0),
+            vop2(V_ADD_NC_U32, 2, 1, 2),
+            vop2(V_AND_B32, 2, int(63), 2),
+            vop2(V_LSHLREV_B32, 2, int(2), 2),
+        ]);
+        inner(&mut w);
+        w.push(vop1(V_MOV_B32, 12, v(1)));
+        epilogue(&mut w);
+        w
+    };
+    let workloads: Vec<(&str, Vec<u32>)> = vec![
+        ("empty (the store alone)", body(&|_| {})),
+        (
+            "128 dependent shuffles across the halves (ds_bpermute)",
+            body(&|w| {
+                for _ in 0..N {
+                    w.extend(ds(DS_BPERMUTE_B32, 1, 2, 1));
+                    w.push(S_WAITCNT_LGKM0);
+                }
+            }),
+        ),
+        (
+            "128 lane reads by a scalar lane (v_readlane) and adds",
+            body(&|w| {
+                for _ in 0..N {
+                    w.extend(vop3(V_READLANE_B32, 20, v(1), 0));
+                    w.push(vop2(V_ADD_NC_U32, 1, 20, 1));
+                }
+            }),
+        ),
+        (
+            "128 compares read back as data (vcc_hi into a VGPR)",
+            body(&|w| {
+                for _ in 0..N {
+                    w.push(vopc(V_CMP_LE_U32, 0, 1));
+                    w.push(vop2(V_ADD_NC_U32, 1, VCC_HI, 1));
+                }
+            }),
+        ),
+        (
+            "1024 adds and xors, no cross-lane code",
+            body(&|w| {
+                for _ in 0..512 {
+                    w.push(vop2(V_ADD_NC_U32, 1, int(3), 1));
+                    w.push(vop2(V_XOR_B32, 1, 0, 1));
+                }
+            }),
+        ),
+        (
+            "8 whole-wave sums (the compiler's DPP/permlane form)",
+            body(&|w| {
+                // (the sum's own scratch is v1 and v2: the running value is kept in v9)
+                w.push(vop1(V_MOV_B32, 9, v(1)));
+                for _ in 0..8 {
+                    w.push(vop1(V_MOV_B32, 7, v(9)));
+                    w.extend(super::wave::WAVE_OR_V7_TO_S7.iter().map(|&x| {
+                        if x >> 25 == 0x1C { x & 0x01FF_FFFF | V_ADD_NC_U32 << 25 } else { x }
+                    }));
+                    w.push(vop2(V_ADD_NC_U32, 9, 7, 9));
+                }
+                w.push(vop1(V_MOV_B32, 1, v(9)));
+            }),
+        ),
+    ];
+    let _one = one_at_a_time();
+    let mut base = [0.0f64; 2];
+    let mut rows = Vec::new();
+    for (n, (name, words)) in workloads.iter().enumerate() {
+        let mut ms = [f64::NAN; 2];
+        for (m, dual) in [false, true].into_iter().enumerate() {
+            DUAL.set(dual);
+            let card = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| card(name, words)));
+            DUAL.set(false);
+            match card {
+                Ok(Some(c)) => ms[m] = c.time([0, 1, u32::MAX, u32::MAX], GROUPS, REPS),
+                Ok(None) => return,
+                Err(_) => eprintln!("{name}: the {} form does not lower", if dual { "dual-bank" } else { "paired" }),
+            }
+        }
+        if n == 0 {
+            base = ms;
+        }
+        rows.push((name, ms));
+    }
+    eprintln!("\nms per dispatch of {GROUPS} groups (median of {REPS}), less the empty program's");
+    eprintln!("{:<58} {:>10} {:>10} {:>8}", "workload", "paired", "dual-bank", "ratio");
+    for (name, ms) in rows {
+        let (p, d) = (ms[0] - base[0], ms[1] - base[1]);
+        eprintln!("{name:<58} {p:>10.2} {d:>10.2} {:>8.2}", d / p);
+    }
+    eprintln!("empty program itself: paired {:.2} ms, dual-bank {:.2} ms", base[0], base[1]);
 }
 
 /// Every lane the model claims, compared; the first few differences named.
@@ -596,4 +762,242 @@ fn a_shuffle_in_partial_groups_stays_in_its_console_wave() {
         }
         eprintln!("{what}: 32 cases as the model in every console wave");
     }
+}
+
+thread_local! {
+    /// The cards of this thread's tests take the dual-bank form ([`crate::dualbank`]).
+    static DUAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Every lane test once more with the console wave in one host wave of 32, two console lanes
+/// per host lane (dual-bank), against the same model.
+mod dual_bank {
+    fn dual(test: fn()) {
+        super::DUAL.set(true);
+        test();
+        super::DUAL.set(false);
+    }
+    #[test]
+    fn a_shuffle_reads_every_lane_of_the_console_wave() {
+        dual(super::a_shuffle_reads_every_lane_of_the_console_wave);
+    }
+    #[test]
+    fn a_shuffle_under_random_masks_keeps_the_inactive_lanes() {
+        dual(super::a_shuffle_under_random_masks_keeps_the_inactive_lanes);
+    }
+    #[test]
+    fn a_lane_read_reaches_both_halves() {
+        dual(super::a_lane_read_reaches_both_halves);
+    }
+    #[test]
+    fn a_lane_write_reaches_both_halves() {
+        dual(super::a_lane_write_reaches_both_halves);
+    }
+    #[test]
+    fn the_first_active_lane_is_found_in_either_half() {
+        dual(super::the_first_active_lane_is_found_in_either_half);
+    }
+    #[test]
+    fn a_ballot_holds_both_halves() {
+        dual(super::a_ballot_holds_both_halves);
+    }
+    #[test]
+    fn a_prefix_count_runs_across_the_halves() {
+        dual(super::a_prefix_count_runs_across_the_halves);
+    }
+    #[test]
+    fn a_whole_wave_sum_of_lane_ids_is_2016() {
+        dual(super::a_whole_wave_sum_of_lane_ids_is_2016);
+    }
+    #[test]
+    fn lanes_left_out_by_exec_keep_their_values() {
+        dual(super::lanes_left_out_by_exec_keep_their_values);
+    }
+    #[test]
+    fn a_shuffle_in_partial_groups_stays_in_its_console_wave() {
+        dual(super::a_shuffle_in_partial_groups_stays_in_its_console_wave);
+    }
+}
+
+/// A per-lane if/else as the console compiler writes it: `v_cmp`, `s_and_saveexec_b64`,
+/// `s_cbranch_execz` past the `then` lanes, `s_andn2_b64` to the `else` lanes and
+/// `s_cbranch_execz` past them, EXEC restored. Lanes below s0 take v1, the others 7, on
+/// both sides of the 31/32 boundary, including when one side has no lane (both branches
+/// taken).
+#[test]
+fn an_if_else_on_lane_masks_runs_each_side_in_its_lanes() {
+    use crate::gfx10::{Encoding, opcode};
+    let sop1 = |name: &str, sdst: u32, ssrc0: u32| {
+        0xBE80_0000 | sdst << 16 | u32::from(opcode(Encoding::Sop1, name).expect(name)) << 8 | ssrc0
+    };
+    let sop2 = |name: &str, sdst: u32, ssrc0: u32, ssrc1: u32| {
+        0x8000_0000 | u32::from(opcode(Encoding::Sop2, name).expect(name)) << 23 | sdst << 16 | ssrc1 << 8 | ssrc0
+    };
+    let execz = 0xBF80_0000 | u32::from(opcode(Encoding::Sopp, "s_cbranch_execz").expect("execz")) << 16;
+    let mut w = prologue();
+    w.push(vopc(0xC4, 0, 0)); // v_cmp_gt_u32 vcc, s0, v0
+    w.push(sop1("s_and_saveexec_b64", 20, VCC_LO)); // s[20:21] = exec; exec &= vcc
+    let skip_then = w.len();
+    w.push(execz);
+    w.push(vop1(V_MOV_B32, 12, v(1)));
+    let else_at = w.len();
+    w.push(sop2("s_andn2_b64", EXEC, 20, EXEC)); // exec = saved & ~exec
+    let skip_else = w.len();
+    w.push(execz);
+    w.push(vop1(V_MOV_B32, 12, int(7)));
+    let end = w.len();
+    epilogue(&mut w);
+    let rel = |from: usize, to: usize| (to as i32 - (from as i32 + 1)) as u16 as u32;
+    w[skip_then] |= rel(skip_then, else_at);
+    w[skip_else] |= rel(skip_else, end);
+    let _one = one_at_a_time();
+    let Some(card) = card("if/else", &w) else { return };
+    for below in [0u32, 1, 31, 32, 33, 63, 64] {
+        let got = card.run([below, 0, 0, 0]);
+        let want: [u32; 64] = std::array::from_fn(|l| if (l as u32) < below { 0x1000 + l as u32 } else { 7 });
+        compare(&format!("if/else, lanes below {below} take v1"), &got, &some(want));
+    }
+    eprintln!("if/else: lanes 0, 1, 31, 32, 33, 63, 64 as the model");
+}
+
+#[test]
+fn dual_bank_an_if_else_on_lane_masks_runs_each_side_in_its_lanes() {
+    DUAL.set(true);
+    an_if_else_on_lane_masks_runs_each_side_in_its_lanes();
+    DUAL.set(false);
+}
+
+/// 3D thread groups: lanes follow the linear thread id `x + X * (y + Y * z)` (x fastest), so
+/// each thread computes its linear id from v0, v1, v2 and shuffles by it. Groups of 4x4x4
+/// (one console wave) and 8x4x4 (two). Every thread must have its own (x, y, z), and each
+/// console wave's shuffle stays among its own lanes.
+fn three_d(threads: [u32; 3]) {
+    let [x, y, _] = threads;
+    let (lx, ly) = (x.trailing_zeros(), y.trailing_zeros());
+    let mut w = vec![
+        vop2(V_LSHLREV_B32, 3, int(lx + ly), 2), // v3 = z << (lx + ly)
+        vop2(V_LSHLREV_B32, 4, int(lx), 1),      // v4 = y << lx
+        vop2(V_ADD_NC_U32, 3, v(4), 3),
+        vop2(V_ADD_NC_U32, 3, v(0), 3), // v3 = the linear id
+        vop2(V_ADD_NC_U32, 1, LITERAL, 3),
+        0x1000,
+        vop2(V_LSHLREV_B32, 14, int(2), 3),
+        vop1(V_MOV_B32, 12, LITERAL),
+        DEAD,
+        sop1(S_MOV_B64, 22, EXEC),
+        vop2(V_XOR_B32, 2, 0, 3), // v2 = s0 ^ lin
+        vop2(V_ADD_NC_U32, 2, 1, 2),
+        vop2(V_AND_B32, 2, int(63), 2),
+        vop2(V_LSHLREV_B32, 2, int(2), 2),
+        sop1(S_MOV_B64, EXEC, 2),
+    ];
+    w.extend(ds(DS_BPERMUTE_B32, 12, 2, 1));
+    w.push(S_WAITCNT_LGKM0);
+    epilogue(&mut w);
+    let group: u32 = threads.iter().product();
+    let what = format!("3D group {threads:?}");
+    let Some(card) = card_with(&what, &w, move |n| {
+        if let crate::native::StageIo::Cs(cs) = &mut n.io {
+            cs.threads = threads;
+            cs.rsrc2 |= 2 << 11; // v0, v1, v2: x, y, z
+        }
+    }) else {
+        return;
+    };
+    let mut rng = Rng(0x5EED_0000_0000_0008 + u64::from(group));
+    for case in 0..24 {
+        let (sx, sy) = match case {
+            0 => (0, 0),
+            1 => (0, 1),
+            2 => (32, 0),
+            _ => ((rng.next() % 64) as u32, (rng.next() % 64) as u32),
+        };
+        let got = card.run([sx, sy, u32::MAX, u32::MAX]);
+        for wave in 0..group / 64 {
+            let first = wave * 64;
+            let data: [u32; 64] = std::array::from_fn(|l| 0x1000 + first + l as u32);
+            let want = model::bpermute(&[DEAD; 64], &model::shuffle_addr(sx, sy), &data, u64::MAX);
+            let got_wave: Vec<u32> = (0..64).map(|l| got[(first + l) as usize]).collect();
+            compare(&format!("{what}, console wave {wave}, x {sx}, y {sy}"), &got_wave, &want);
+        }
+    }
+    eprintln!("{what}: 24 cases as the model in every console wave");
+}
+
+#[test]
+fn three_dimensional_groups_number_lanes_x_first() {
+    let _one = one_at_a_time();
+    three_d([4, 4, 4]);
+    three_d([8, 4, 4]);
+}
+
+#[test]
+fn dual_bank_three_dimensional_groups_number_lanes_x_first() {
+    DUAL.set(true);
+    three_dimensional_groups_number_lanes_x_first();
+    DUAL.set(false);
+}
+
+/// A loop whose trip count is per lane, `(lane & 7) + (lane >> 5)` (so the halves differ),
+/// leaving it lane by lane (`s_and_b64 exec, exec, vcc`, `s_cbranch_execz`), with an if
+/// inside it on odd iterations (`s_and_saveexec_b64`, `s_cbranch_execz`, `s_or_b64` back).
+/// Each lane adds 1 per iteration and 100 more on odd ones.
+#[test]
+fn a_loop_with_an_if_inside_runs_each_lane_its_own_count() {
+    use crate::gfx10::{Encoding, opcode};
+    let sop1n = |name: &str, sdst: u32, ssrc0: u32| {
+        0xBE80_0000 | sdst << 16 | u32::from(opcode(Encoding::Sop1, name).expect(name)) << 8 | ssrc0
+    };
+    let sop2n = |name: &str, sdst: u32, ssrc0: u32, ssrc1: u32| {
+        0x8000_0000 | u32::from(opcode(Encoding::Sop2, name).expect(name)) << 23 | sdst << 16 | ssrc1 << 8 | ssrc0
+    };
+    let sopp = |name: &str| 0xBF80_0000 | u32::from(opcode(Encoding::Sopp, name).expect(name)) << 16;
+    let mut w = prologue();
+    w.extend([
+        vop1(V_MOV_B32, 12, int(0)),       // acc
+        vop1(V_MOV_B32, 6, int(0)),        // i
+        vop2(0x16, 8, int(5), 0),          // v_lshrrev_b32 v8, 5, v0
+        vop2(V_AND_B32, 5, int(7), 0),     // v5 = lane & 7
+        vop2(V_ADD_NC_U32, 5, v(8), 5),    // t = (lane & 7) + (lane >> 5)
+    ]);
+    let top = w.len();
+    w.push(vopc(0xC1, v(6), 5)); // v_cmp_lt_u32 vcc, v6, v5: i < t
+    w.push(sop2n("s_and_b64", EXEC, EXEC, VCC_LO));
+    let leave = w.len();
+    w.push(sopp("s_cbranch_execz"));
+    w.push(vop2(V_AND_B32, 7, int(1), 6));
+    w.push(vopc(0xC5, int(0), 7)); // v_cmp_ne_u32 vcc, 0, v7: i odd
+    w.push(sop1n("s_and_saveexec_b64", 24, VCC_LO));
+    let skip = w.len();
+    w.push(sopp("s_cbranch_execz"));
+    w.push(vop2(V_ADD_NC_U32, 12, int(64), 12));
+    w.push(vop2(V_ADD_NC_U32, 12, int(36), 12)); // + 100
+    let join = w.len();
+    w.push(sop2n("s_or_b64", EXEC, EXEC, 24));
+    w.push(vop2(V_ADD_NC_U32, 12, int(1), 12));
+    w.push(vop2(V_ADD_NC_U32, 6, int(1), 6));
+    let back = w.len();
+    w.push(sopp("s_branch"));
+    let end = w.len();
+    epilogue(&mut w);
+    let rel = |from: usize, to: usize| (to as i32 - (from as i32 + 1)) as u16 as u32;
+    w[leave] |= rel(leave, end);
+    w[skip] |= rel(skip, join);
+    w[back] |= rel(back, top);
+    let _one = one_at_a_time();
+    let Some(card) = card("loop with an if", &w) else { return };
+    let got = card.run([0; 4]);
+    let want: [u32; 64] = std::array::from_fn(|l| {
+        let t = (l as u32 & 7) + (l as u32 >> 5);
+        (0..t).map(|i| 1 + if i & 1 == 1 { 100 } else { 0 }).sum()
+    });
+    compare("loop with an if inside", &got, &some(want));
+    eprintln!("loop with an if: every lane its own count, as the model");
+}
+
+#[test]
+fn dual_bank_a_loop_with_an_if_inside_runs_each_lane_its_own_count() {
+    DUAL.set(true);
+    a_loop_with_an_if_inside_runs_each_lane_its_own_count();
+    DUAL.set(false);
 }

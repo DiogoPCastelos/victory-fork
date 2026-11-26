@@ -74,6 +74,8 @@ struct Tally {
     /// The census of lowering paths: what the translator did with the console's lanes,
     /// by stage and wave size → programs, and the first one ([`path_of`]).
     paths: BTreeMap<String, (usize, String)>,
+    /// Wave64 graphics programs by the cross-lane code they hold ([`graphics_lanes`]).
+    graphics: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
@@ -96,6 +98,9 @@ impl Tally {
     fn merge(&mut self, other: Tally) {
         for (k, (n, e)) in other.paths {
             self.paths.entry(k).or_insert((0, e)).0 += n;
+        }
+        for (k, (n, e)) in other.graphics {
+            self.graphics.entry(k).or_insert((0, e)).0 += n;
         }
         self.containers += other.containers;
         self.duplicates += other.duplicates;
@@ -380,6 +385,14 @@ pub fn run(
             println!("pair {v} + {p}: {made}");
         }
     }
+    if !t.graphics.is_empty() {
+        println!("64-lane graphics programs by the cross-lane code that may depend on the console's 64-lane grouping:");
+        let mut g: Vec<_> = t.graphics.iter().collect();
+        g.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+        for (k, (n, example)) in g {
+            println!("  {n:>7}  {k}  (e.g. {example})");
+        }
+    }
     if !t.paths.is_empty() {
         println!("lowering paths (host waves of at most {} lanes; programs that translated):", host_wave_note());
         let mut paths: Vec<_> = t.paths.iter().collect();
@@ -557,9 +570,17 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                             census_line(&label(), &p, &program, &shader);
                             let path = path_of(&p);
                             if t.list {
-                                t.lines.push(format!("{}  path: {path}", label()));
+                                t.lines.push(format!("{}  path: {path}; vgprs {}, {} instructions", label(), p.vgprs, program.blocks.iter().map(|b| b.insts.len()).sum::<usize>()));
                             }
                             t.paths.entry(path).or_insert_with(|| (0, label())).0 += 1;
+                            if p.wave64 && p.stage != HwStage::Cs {
+                                let uses = graphics_lanes(&program, &r);
+                                if t.list && !uses.is_empty() {
+                                    t.lines.push(format!("{}  64-lane graphics, may depend on the console's grouping: {uses}", label()));
+                                }
+                                let key = if uses.is_empty() { "none of the code below".to_owned() } else { uses };
+                                t.graphics.entry(format!("{:?}: {key}", p.stage)).or_insert_with(|| (0, label())).0 += 1;
+                            }
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
                         }
@@ -899,7 +920,9 @@ fn path_of(p: &NativeProgram) -> String {
     let (took, bits) = emit::last_path();
     let has = |b: u8| bits & b != 0;
     let stage = format!("{:?} wave{}", p.stage, if p.wave64 { 64 } else { 32 });
-    let what = if !p.wave64 {
+    let what = if took.starts_with("dual-bank") {
+        "one host wave of 32, two console lanes per lane (dual-bank)".to_owned()
+    } else if !p.wave64 {
         "as it is".to_owned()
     } else if has(form::WAVE64) {
         "kept 64-lane waves (a 32-lane host refuses the pipeline)".to_owned()
@@ -930,4 +953,94 @@ fn path_of(p: &NativeProgram) -> String {
     };
     let approx = if has(form::APPROX_LANE_WRITE) { " + a lane write where not every lane runs: APPROXIMATE" } else { "" };
     format!("{stage}: {what}{approx}; {took}")
+}
+
+/// The cross-lane code of a console wave64 graphics program whose results may differ when its
+/// lanes run in host waves of 32 instead of the console's 64: the translator lowers whole-wave
+/// sections to DXIL wave operations over the host's wave (HLSL's contract), and reads lanes by
+/// the host's numbering. Empty: no such code. Code confined to rows of 16 or quads (DPP,
+/// `v_permlane16`/`x16`, `ds_swizzle`) runs the same within a 32-lane wave and is not listed.
+/// shortcut: by instruction alone; how a result is used (a branch that only skips work, or
+/// data that is stored) is not followed, so this lists what *may* depend on the grouping.
+fn graphics_lanes(program: &ir::Program, res: &resource::Resources) -> String {
+    let mut uses = std::collections::BTreeSet::new();
+    for i in program.blocks.iter().flat_map(|b| &b.insts) {
+        let n = i.name();
+        let what = match n {
+            _ if n.ends_with("_saveexec_b64") && (n.starts_with("s_or") || n.starts_with("s_nand")) => {
+                "whole-wave sections (wave reductions, scans, votes)"
+            }
+            // a waterfall loop's read of a lane's descriptor: each lane gets its own
+            "v_readfirstlane_b32" if i.writes.first().is_some_and(|w| res.waterfall.reads.contains(&w.1)) => continue,
+            // the same value in every lane (scalars through lane-independent vector code): any
+            // lane's is the console's first lane's
+            "v_readfirstlane_b32" if uniform_source(program, i) => continue,
+            "v_readfirstlane_b32" => "first-lane reads of values that may differ by lane",
+            "v_readlane_b32" | "v_writelane_b32" => "lane reads or writes by number",
+            _ if n.starts_with("v_mbcnt") => "lane counts (v_mbcnt)",
+            "ds_bpermute_b32" | "ds_permute_b32" => "arbitrary lane shuffles",
+            _ => continue,
+        };
+        uses.insert(what);
+    }
+    uses.into_iter().collect::<Vec<_>>().join(", ")
+}
+
+/// Whether the VGPR a `v_readfirstlane_b32` reads holds the same value in every lane, by a
+/// conservative walk back through its definitions: scalars, constants and scalar loads are
+/// uniform; a VALU result is if its vector sources are and it does not depend on the lane;
+/// phis, memory reads, thread ids and initial VGPRs are taken as varying.
+fn uniform_source(program: &ir::Program, read: &ir::Inst) -> bool {
+    use std::collections::HashMap;
+    use victory_shader::ir::Reg;
+    let mut defs: HashMap<victory_shader::ir::Value, &ir::Inst> = HashMap::new();
+    for i in program.blocks.iter().flat_map(|b| &b.insts) {
+        for &(_, v) in &i.writes {
+            defs.insert(v, i);
+        }
+    }
+    fn lane_dependent(name: &str) -> bool {
+        name.starts_with("v_mbcnt")
+            || name.starts_with("v_readlane")
+            || name.starts_with("v_writelane")
+            || name.starts_with("v_permlane")
+            || name.starts_with("v_interp")
+            || name.starts_with("v_cndmask")
+            || name.starts_with("v_cmp")
+            || name.starts_with("ds_")
+            || name.starts_with("buffer_")
+            || name.starts_with("tbuffer_")
+            || name.starts_with("image_")
+            || name.starts_with("global_")
+            || name.starts_with("flat_")
+            || name.starts_with("scratch_")
+    }
+    fn walk(defs: &HashMap<victory_shader::ir::Value, &ir::Inst>, v: victory_shader::ir::Value, reg: Reg, depth: u32) -> bool {
+        if matches!(reg, Reg::S(_) | Reg::Scc) {
+            return true;
+        }
+        if depth == 0 {
+            return false;
+        }
+        let Some(i) = defs.get(&v) else {
+            // a phi or an initial VGPR (thread id, interpolant): taken as varying
+            return false;
+        };
+        let name = i.name();
+        if !name.starts_with("v_") || lane_dependent(name) {
+            return false;
+        }
+        if matches!(&i.fields, victory_shader::gfx10::Fields::Valu(x) if x.dpp.is_some() || x.sdwa.is_some()) {
+            return false;
+        }
+        let written: Vec<Reg> = i.writes.iter().map(|w| w.0).collect();
+        i.reads
+            .iter()
+            .filter(|(r, _)| !written.contains(r) && *r != Reg::S(victory_shader::ir::EXEC) && *r != Reg::S(victory_shader::ir::EXEC + 1))
+            .all(|&(r, x)| walk(defs, x, r, depth - 1))
+    }
+    read.reads
+        .iter()
+        .filter(|(r, _)| matches!(r, Reg::V(_)))
+        .all(|&(r, x)| walk(&defs, x, r, 24))
 }

@@ -18,6 +18,12 @@ pub struct Host {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// GPU milliseconds of the last [`Host::dispatch`] on this thread (timestamps around it).
+    pub static GPU_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(f64::NAN) };
+}
+
+#[cfg(test)]
 impl Host {
     /// The device's `WaveLaneCountMin` and `WaveLaneCountMax` (`D3D12_FEATURE_D3D12_OPTIONS1`);
     /// (0, 0) if it does not say.
@@ -1411,7 +1417,28 @@ impl Host {
                 }
             }
             let [x, y, z] = d.groups;
+            // GPU timestamps around the dispatch ([`GPU_MS`]): the dispatch's own time,
+            // without the list's setup or the read-back
+            let mut stamps: Option<ID3D12QueryHeap> = None;
+            dev.CreateQueryHeap(
+                &D3D12_QUERY_HEAP_DESC {
+                    Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                    Count: 2,
+                    NodeMask: 0,
+                },
+                &mut stamps,
+            )
+            .map_err(err)?;
+            let stamps = stamps.ok_or("no timestamp query heap")?;
+            let stamps_rb = make(
+                D3D12_HEAP_TYPE_READBACK,
+                &buffer(16, D3D12_RESOURCE_FLAG_NONE),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )?;
+            list.EndQuery(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
             list.Dispatch(x, y, z);
+            list.EndQuery(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            list.ResolveQueryData(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &stamps_rb, 0);
             for (r, size, n, rb) in &uavs {
                 // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(
@@ -1440,6 +1467,14 @@ impl Host {
                     return Err(format!("device removed: {}", err(e)));
                 }
                 std::thread::yield_now();
+            }
+            if let Ok(hz) = queue.GetTimestampFrequency() {
+                let mut p = std::ptr::null_mut();
+                if stamps_rb.Map(0, None, Some(&mut p)).is_ok() {
+                    let t = std::slice::from_raw_parts(p.cast::<u64>(), 2);
+                    GPU_MS.set(t[1].saturating_sub(t[0]) as f64 * 1e3 / hz as f64);
+                    stamps_rb.Unmap(0, None);
+                }
             }
             let mut out = Vec::new();
             for (_, size, n, rb) in &uavs {

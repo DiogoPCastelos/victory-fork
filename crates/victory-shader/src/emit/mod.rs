@@ -342,6 +342,10 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+/// Why a program is refused that would ask a host of 32-lane waves for 64
+/// ([`emit`]).
+pub const NEEDS_WAVE64: &str = "a console wave64 compute program that still needs 64-lane waves, which this GPU does not have (shared memory or lane exchanges where the two 32-lane halves cannot meet)";
+
 thread_local! {
     /// Which of [`emit`]'s attempts gave the last result on this thread ([`last_path`]).
     static TOOK: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
@@ -360,6 +364,12 @@ pub fn last_path() -> (&'static str, u8) {
 }
 
 /// Emits a program whose earlier stages already ran.
+///
+/// Never a program that asks a host whose waves are at most 32 lanes for
+/// `WaveSize(64)`: the driver refuses such a pipeline (`E_INVALIDARG`,
+/// seven compute programs of the title on the RTX 3060 Laptop), so the
+/// program is refused here instead, with the reason ([`NEEDS_WAVE64`]), as
+/// any other that does not translate.
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -368,6 +378,21 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    let (shader, wave) = emit_any(c, native, p, st, io, res)?;
+    if lower::host_max_wave() == 32 && wave == Some(64) {
+        return Err(ShaderError::Unsupported { offset: 0, what: NEEDS_WAVE64 });
+    }
+    Ok(shader)
+}
+
+fn emit_any(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     took("first try");
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
@@ -436,7 +461,7 @@ pub fn emit(
                 report(name, &again);
                 if done(&again) {
                     took("retry: another form of the program");
-                    return again.map(|(shader, _)| shader);
+                    return again;
                 }
             }
         }
@@ -462,7 +487,33 @@ pub fn emit(
                     report("without skips, scalars followed", &again);
                     if done(&again) {
                         took("retry: skips left out");
-                        return again.map(|(shader, _)| shader);
+                        return again;
+                    }
+                }
+                // Dual-bank ([`crate::dualbank`]): the console wave in one host wave of 32,
+                // two console lanes per host lane; exact, with no barrier. Before the
+                // approximate forms. `VICTORY_DUAL_BANK=0`: not tried.
+                if std::env::var_os("VICTORY_DUAL_BANK").is_none_or(|v| v != "0") {
+                    match crate::dualbank::transform(native) {
+                        Ok(dual) => {
+                            let again = (|| {
+                                let p = crate::spill::build(&dual)?;
+                                let st = structure::structure(&p)?;
+                                let res = resource::track(&p, &dual.layout, dual.stage, Some(&st))?;
+                                let io = io::raise(&p, &dual)?;
+                                lower::with_dual_bank(|| emit_program(c, &dual, &p, &st, &io, &res))
+                            })();
+                            report("dual-bank", &again);
+                            if done(&again) {
+                                took("dual-bank (exact)");
+                                return again;
+                            }
+                        }
+                        Err(e) => {
+                            if why {
+                                eprintln!("WAVE64-RETRY dual-bank: {e}");
+                            }
+                        }
                     }
                 }
                 // Still stopped where not every lane runs: the per-lane branches around
@@ -480,7 +531,7 @@ pub fn emit(
                         report("wave-wide branches", &again);
                         if done(&again) {
                             took("retry: wave-wide branches");
-                            return again.map(|(shader, _)| shader);
+                            return again;
                         }
                     }
                 }
@@ -499,7 +550,7 @@ pub fn emit(
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
                         took(if exact { "local waves: the allocation idiom (exact)" } else { "local waves: APPROXIMATE" });
-                        return local.map(|(shader, _)| shader);
+                        return local;
                     }
                 }
             }
@@ -508,7 +559,7 @@ pub fn emit(
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
                     took(if exact { "local waves: the allocation idiom (exact)" } else { "local waves: APPROXIMATE" });
-                    return local.map(|(shader, _)| shader);
+                    return local;
                 }
             }
         }
@@ -521,7 +572,7 @@ pub fn emit(
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
                             took("local waves: APPROXIMATE, any mask");
-                            return local.map(|(shader, _)| shader);
+                            return local;
                         }
                     }
                 }
@@ -529,7 +580,33 @@ pub fn emit(
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     took("local waves: APPROXIMATE, any mask");
-                    return local.map(|(shader, _)| shader);
+                    return local;
+                }
+            }
+        }
+        // Last of all, where every other form still needs 64-lane waves (no pipeline at all on
+        // this host: [`emit`] refuses them): the branches around the places the two halves
+        // must meet taken wave-wide although `VICTORY_WAVE_WIDE=1` was not asked for. Only
+        // for thread groups of one console wave ([`widen`]), where both host waves of the
+        // group take every such branch together. Not before the forms above: a program one of
+        // them takes keeps the translation it had (the particle light-atlas programs that lost
+        // the card in this form, runs 121-124, are among those). `VICTORY_WAVE_WIDE=0` turns
+        // this off.
+        if !wide_on && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") {
+            let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+            let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches (last resort)", &again);
+                if done(&again) {
+                    took("retry: wave-wide branches (last resort)");
+                    return again;
                 }
             }
         }
@@ -555,7 +632,6 @@ pub fn emit(
         }
         other => other,
     };
-    let original = original.map(|(shader, _)| shader);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -570,7 +646,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    emit_program(c, native, &p, &st, &io, &res)
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane

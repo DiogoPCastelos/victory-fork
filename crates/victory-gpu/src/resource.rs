@@ -1463,14 +1463,22 @@ pub(crate) fn room() -> bool {
 /// Whether the system's commit (RAM and page file) has more than
 /// `VICTORY_TEXTURE_SPILL_COMMIT_MB` (4,096; 0: not looked at) left, for
 /// textures past the card's own share. Shared memory is the PC's RAM: on a
-/// 16 GB machine, with this layer's card copies of title buffers (700 MB
-/// and more) and the title's own streaming, the spill took the commit to
-/// its limit within 3.5 minutes of a world run; draws were dropped by the
-/// thousands a frame (3,466 against 350 without the spill) and then the
-/// card copies could not be brought up to date (E_OUTOFMEMORY), which ends
-/// the run. The floor sits above the pipeline workers' (2,048,
+/// 16 GB machine a world run ended within 3.5 minutes when the card copies
+/// could not be brought up to date (E_OUTOFMEMORY), the system's commit
+/// used up. The floor sits above the pipeline workers' (2,048,
 /// `VICTORY_PIPELINE_COMMIT_MB`) so textures stop spilling first. Asked at
 /// most every 100 ms.
+///
+/// Measured since (16 GB RAM, 6 GB card, 10-minute world runs): the spill
+/// is not what used the commit up. From the world's first frames the card
+/// is past its own share and the PC memory shared with it holds 4.6-6.7 GB
+/// (the windows outside buffers alone 3.2 GB, all in the PC's memory), over
+/// half of the shared budget (7.4 GB), so the rule above returns false
+/// before this floor is asked, and the run sits at 0.4-2 GB of commit left
+/// with or without it, as the fork without the frame-rate work does
+/// (`docs/fork-findings-6gb-laptop.md`, "Memory on a 16 GB machine"). The
+/// thousands of drops a frame in that run's frame lines were the
+/// ray-tracing builder's stages (off by default), not draws.
 fn spill_commit_left() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     use std::sync::atomic::{AtomicBool, AtomicU64};

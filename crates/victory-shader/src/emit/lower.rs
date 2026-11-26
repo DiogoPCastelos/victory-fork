@@ -1171,6 +1171,20 @@ thread_local! {
     static LAST_FORM: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    /// Lowering a program rewritten by [`crate::dualbank`]: its lanes stand for two console
+    /// lanes each, so its host waves must be exactly 32 lanes (`WaveSize(32)`).
+    static DUAL_BANK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` lowering a dual-bank program ([`crate::dualbank`]).
+pub(super) fn with_dual_bank<R>(f: impl FnOnce() -> R) -> R {
+    let was = DUAL_BANK.replace(true);
+    let r = f();
+    DUAL_BANK.set(was);
+    r
+}
+
 /// The [`form`] bits of the last successful lowering on this thread.
 pub fn last_form() -> u8 {
     LAST_FORM.get()
@@ -1553,7 +1567,7 @@ impl<'a> Lower<'a> {
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
             }
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            if console_lanes || one_wave && s.lds_dwords > 0 || DUAL_BANK.get() {
                 s.wave_size = Some(wave);
             }
         }
@@ -2373,6 +2387,14 @@ impl<'a> Lower<'a> {
         }
         self.cur = self.s.entry;
         self.find_sections();
+        // Primitive-ordered pixel shading (POPS): a pixel program that reads the overlap
+        // registers (`src_pops_exiting_wave_id`, `HW_REG_POPS_PACKER`) to wait for the
+        // older pixels it overlaps.
+        self.s.rov = self.s.pixel
+            && self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                let text = i.machine.text(self.x.native.wave64);
+                text.contains("src_pops_exiting_wave_id") || text.contains("HW_REG_POPS_PACKER")
+            });
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
@@ -2500,6 +2522,11 @@ impl<'a> Lower<'a> {
                     // paths only seem to allow it before any save: the lane of a VGPR
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
+                    // A pixel program that orders overlapping pixels (POPS) gets the
+                    // hardware's overlap word after its user data: 0 says no older wave
+                    // overlaps this one, so it waits for none. The host orders those pixels
+                    // itself: every UAV of the program is rasterizer ordered (`Shader::rov`).
+                    None if self.s.rov => Val::I32(self.s.m.i32(0)),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -3352,6 +3379,9 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            // `src_pops_exiting_wave_id`: read only by the wait for older overlapping pixels,
+            // which a POPS program skips on the host (its overlap word is 0: `inputs`).
+            Operand::Const(239) if self.s.rov => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -3839,7 +3869,7 @@ impl<'a> Lower<'a> {
         // and lanes 16..31 read 0; found by `lane_tests`). So only full waves count off
         // the counter; the short one takes the last run.
         let group = self.s.threads.map_or(0, |t| t.iter().product::<u32>());
-        let full = if group % 32 != 0 {
+        let full = if !group.is_multiple_of(32) {
             let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
             let here = self.s.m.bool(true);
             let ballot = self.s.op(e, "waveActiveBallot", Attr::NoUnwind, four, 116, &[here]);
@@ -4448,6 +4478,17 @@ impl<'a> Lower<'a> {
     /// The console wave size.
     fn wave(&self) -> u32 {
         if self.x.native.wave64 { 64 } else { 32 }
+    }
+
+    /// A lane number as the ISA takes it for `v_readlane` / `v_writelane`: modulo the wave.
+    fn lane_mod(&mut self, lane: V) -> V {
+        // (a constant lane is the console compiler's, in range; the checks after this one
+        // tell constants from computed lanes)
+        if matches!(lane, V::Const(_)) {
+            return lane;
+        }
+        let last = self.s.m.i32(self.wave() - 1);
+        self.s.m.bin(self.cur, Bin::And, lane, last)
     }
 
     fn lane_index(&mut self) -> V {
@@ -5411,6 +5452,29 @@ impl<'a> Lower<'a> {
                             }
                         };
                         r.push(x);
+                    }
+                    self.set(lo, Val::I32(r[0]));
+                    self.set(hi, Val::I32(r[1]));
+                    let s = nonzero(self, r[0], r[1]);
+                    self.set(scc, Val::Bit(s));
+                    Ok(())
+                }
+                "s_wqm_b64" => {
+                    // Whole quad mode of a scalar: each 4-bit group all ones if any of its bits
+                    // is set; SCC: the result is not zero (a dual-bank program's console EXEC is
+                    // such a scalar, `crate::dualbank`).
+                    let (q, f) = (self.s.m.i32(0x1111_1111), self.s.m.i32(0xF));
+                    let mut r = Vec::new();
+                    for h in 0..2u8 {
+                        let a = half(self, 0, h)?;
+                        let mut any = a;
+                        for n in 1..4 {
+                            let k = self.s.m.i32(n);
+                            let s = self.s.m.bin(c, Bin::LShr, a, k);
+                            any = self.s.m.bin(c, Bin::Or, any, s);
+                        }
+                        let any = self.s.m.bin(c, Bin::And, any, q);
+                        r.push(self.s.m.bin(c, Bin::Mul, any, f));
                     }
                     self.set(lo, Val::I32(r[0]));
                     self.set(hi, Val::I32(r[1]));
@@ -6634,7 +6698,7 @@ impl<'a> Lower<'a> {
             if self.block[q].is_none() {
                 continue;
             }
-            let tail = self.tail[q].ok_or(WHY)?;
+            let tail = self.tail[q].ok_or("a descriptor chosen by control flow, on a loop's back edge")?;
             let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
             let index = match arg {
                 Source::Loaded { load, first } => {
@@ -6646,7 +6710,34 @@ impl<'a> Lower<'a> {
                 Source::Phi { block: inner, args: inner_args } if depth > 0 => {
                     self.descriptor_phi(*inner, inner_args, sampler, depth - 1)?
                 }
-                _ => return Err(WHY),
+                // Chosen by SCC in that predecessor (uniform): both heap indices there and
+                // the one SCC picks, at the predecessor's end.
+                Source::Select { scc, args: choices } => {
+                    let [
+                        Source::Loaded { load: a, first: fa },
+                        Source::Loaded { load: b, first: fb },
+                    ] = choices[..]
+                    else {
+                        return Err("a descriptor chosen by control flow, from a choice by a condition of other descriptors");
+                    };
+                    let here = std::mem::replace(&mut self.cur, at);
+                    let picked = (|| {
+                        let cond = match self.get(*scc)? {
+                            Val::Bit(x) => x,
+                            _ => return Err("SCC without a value"),
+                        };
+                        let set = self.heap_index(a, fa, sampler)?;
+                        let clear = self.heap_index(b, fb, sampler)?;
+                        Ok(self.s.m.select(self.cur, cond, set, clear))
+                    })();
+                    self.cur = here;
+                    picked?
+                }
+                Source::Built { .. } => return Err("a descriptor chosen by control flow, one of them built"),
+                Source::Constant(w) if sampler => return Err(if w.iter().all(|x| *x == 0) { "a sampler chosen by control flow, one of them constant zero" } else { "a sampler chosen by control flow, one of them constant" }),
+                Source::Constant(w) => return Err(if w.iter().all(|x| *x == 0) { "a descriptor chosen by control flow, one of them constant zero" } else { "a descriptor chosen by control flow, one of them constant" }),
+                Source::Phi { .. } => return Err("a descriptor chosen by control flow, joins too deep"),
+                _ => return Err("a descriptor chosen by control flow, one of them per lane"),
             };
             incoming.push((index, at));
         }
@@ -7739,6 +7830,9 @@ impl<'a> Lower<'a> {
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                // the ISA takes the lane modulo the wave size (lane 32 of a wave32 is lane 0;
+                // found by `lane_tests` through `dualbank`)
+                let lane = self.lane_mod(lane);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
                 if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
@@ -7791,6 +7885,7 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
                 };
+                let lane = self.lane_mod(lane);
                 let old = match inst.read(Reg::V(reg)) {
                     Some(o) => self.i32_of(o)?,
                     None => self.s.m.i32(0),

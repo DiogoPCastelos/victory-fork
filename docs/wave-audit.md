@@ -157,6 +157,148 @@ Not covered yet: 3D groups, nested EXEC in loops, the ISA's rule that a `ds_bper
 source lane outside EXEC reads 0 (the translator implements it; the model does not claim it),
 and graphics stages.
 
+## Dual-bank Wave64 (CLAUDE.md step 4, handover §6)
+
+`crates/victory-shader/src/dualbank.rs` rewrites a console wave64 compute program into a
+console wave32 program in which each lane carries two console lanes: p (bank 0) and p + 32
+(bank 1). One host wave of 32 then runs a whole console wave, so nothing has to meet across
+host waves: no barrier, no exchange through LDS. The result goes through the translator like
+any wave32 program, with `WaveSize(32)` pinned.
+
+- **Registers.** Bank 1's VGPRs are bank 0's plus `K` (the program's VGPR count); seven
+  scratch VGPRs follow at `2K`. The console's EXEC lives in a pair of spare SGPRs (the trap
+  temporaries, which compute code never names), so control flow stays scalar, as on the
+  console.
+- **Vector instructions** are written twice: bank 0, then bank 1, each after
+  `s_mov_b32 exec_lo` of that bank's 32 bits of the console EXEC. Inactive lanes keep their
+  values and side effects happen only in active lanes, as on the console.
+- **Lane masks.** A 64-bit lane mask (VCC, compare results, carries, the EXEC pair) splits by
+  dword: bank b's bits are `s[x + b]`. Bank 1's implicit-VCC compares and carries are
+  rewritten into VOP3 (or SDWA `sd`) form, writing `vcc_hi`.
+- **Lane-identity instructions.**
+  - `v_readlane`, `v_writelane` and `v_readfirstlane` pick the bank by bit 5 of the lane.
+  - `v_mbcnt_lo` and `_hi` count the other bank's bits.
+  - `ds_bpermute` reads both banks and picks by bit 5 of the lane it names.
+  - EXEC- and VCC-zero branches test both halves of the pair.
+
+  None of the added code writes SCC or VCC.
+- **Refused, with a reason:**
+  - more than 124 VGPRs;
+  - program-counter instructions;
+  - scratch memory and buffer loads into LDS (per-lane addresses the two banks would share);
+  - `ds_permute`, `ds_append`/`ds_consume`, ordered counts, GWS, `*_addtid`;
+  - DPP compares and SDWA `v_cmpx`, and DPP/SDWA forms of VOP2 with an implicit VCC in
+    bank 1;
+  - multi-dimensional groups whose dimensions are not powers of two.
+- **Selection.** `emit` tries dual-bank after the exact paired forms and before any
+  approximate form (`VICTORY_DUAL_BANK=0`: not tried).
+
+Tests, all run on the RTX 3060 Laptop (2026-11-25): every lane test runs through both paths,
+paired and dual-bank, against the same CPU model, and all of them pass. Two more were added
+for dual-bank: an if/else on lane masks (`s_and_saveexec_b64`, `s_cbranch_execz` both ways,
+`s_andn2_b64` to the else lanes), and the groups of 48 and 96. Making them pass found a
+fourth translator defect: `v_readlane`/`v_writelane` took a computed lane number as it is,
+where the ISA takes it modulo the wave size. Also added: `s_wqm_b64` on scalar data.
+
+Census on the title's pack, 32-lane host, after dual-bank:
+
+| | Before | After |
+|---|---:|---:|
+| compute programs kept at 64 lanes (the RTX 3060 refuses them) | 27 | 5 |
+| compute programs on an APPROXIMATE half-wave form | 38 | 15 |
+| compute programs taken by dual-bank (exact) | – | 45 |
+
+With `--validate --pipelines` on the 65 programs that had no exact path: all 65 pass
+`dxil.dll`; 60 build a pipeline on the RTX 3060, and the 5 that do not are the ones still kept
+at 64 lanes. Every dual-bank program builds. Of the 7 compute pipelines the host refused in
+today's game runs, 4 now build through dual-bank; the other 3 are among those 5.
+
+Still refused by dual-bank: 8 with more than 124 VGPRs, 5 with DPP compares, 4 with
+program-counter instructions, 2 whose branches no longer reach once the code grows, and 3
+translator limits. Not measured yet: whether dual-bank or the paired path is faster
+(CLAUDE.md asks for both to be measured before choosing defaults). Dual-bank is used only
+where the paired path has no exact form, so the defaults for programs that had one are
+unchanged.
+
+### More lane tests (both paths)
+
+- **3D groups** (4×4×4, one console wave; 8×4×4, two): lanes follow the linear thread id,
+  x fastest. Each thread computes its id from v0, v1, v2 and shuffles by it. 24 cases per
+  shape.
+- **A loop with a per-lane trip count** that differs between the halves, left lane by lane
+  (`s_and_b64 exec, exec, vcc`, `s_cbranch_execz`), with an if inside on odd iterations
+  (saveexec, execz, `s_or_b64` back). This is nested EXEC inside a loop.
+
+All of them pass on the RTX 3060 through both the paired and the dual-bank path.
+
+### Paired against dual-bank (handover milestone 5)
+
+`bench_paired_against_dual_bank` (an ignored test: `cargo test -p victory-shader --lib
+bench_paired_against_dual_bank -- --ignored --nocapture --test-threads=1`). Each workload is
+a synthetic one-wave program dispatched as 65,535 groups (4 million console threads), timed
+with GPU timestamps around the dispatch, median of 5 after a warm-up. Totals in ms on the
+RTX 3060 Laptop, four runs, 2026-11-25:
+
+| Workload | Paired | Dual-bank |
+|---|---:|---:|
+| empty program (the store alone) | 0.02–0.13 | 0.42 |
+| 128 dependent `ds_bpermute` across the halves | 2.4–2.5 | 1.58 |
+| 128 `v_readlane` by a scalar lane, and adds | 2.5–2.6 | 0.80 |
+| 128 compares read back as data | 2.4–2.5 | 0.42 |
+| 1024 adds and xors, no cross-lane code | 0.1–1.6 | 1.59 |
+| 8 whole-wave sums (the compiler's DPP/permlane form) | 0.3–0.4 | 0.42 |
+
+How to read it:
+- **Cross-lane code.** Where the paired path exchanges through LDS with group barriers,
+  dual-bank is 1.6–6× faster.
+- **No exchange.** With no cross-lane code, or the compiler's own sums (which pair within
+  32-lane rows), the two are even or the paired path is ahead.
+- **Fixed cost.** Dual-bank's program writes every vector instruction twice and uses twice
+  the VGPRs, which costs it a fixed floor of about 0.4 ms per 4 million threads here.
+- **Conditions.** A game instance from another session was using the GPU during these runs,
+  and the laptop's power state was not controlled. The paired path's plain-arithmetic row
+  is bimodal (0.1 or 1.6 ms) across runs. The cross-lane rows repeat to within 0.15 ms.
+
+What this settles: dual-bank stays where the paired path has no exact form. Programs whose
+paired form exchanges heavily would likely run faster as dual-bank too. Choosing per program
+needs a cost estimate (exchanges and barriers against instruction count), which is not built.
+
+### 64-lane graphics programs and the console's grouping (handover §9)
+
+The census of `victory translate` now also lists, for console wave64 vertex, pixel and mesh
+programs, the cross-lane code whose results may differ when the program runs in host waves
+of 32 rather than the console's 64:
+- whole-wave sections (lowered to DXIL wave operations over the host's wave);
+- first-lane reads of values that may differ by lane;
+- lane reads or writes by number;
+- `v_mbcnt` lane counts;
+- arbitrary lane shuffles.
+
+Code confined to quads or rows of 16 runs the same in a 32-lane wave and is not listed. Two
+kinds of first-lane read are not listed either: those that are waterfall loops' descriptor
+reads (the translator gives each lane its own), and those of values a conservative walk
+proves uniform. `--list` prints each listed program on a line of its own, with hash, stage
+and reasons: the per-title report the handover asks for.
+
+The title's pack (2026-11-25):
+
+| Programs | Stage | Code that may depend on the grouping |
+|---:|---|---|
+| 8,265 | pixel | none |
+| 2,041 | vertex | none |
+| 1,848 | pixel | first-lane reads of possibly varying values |
+| 433 | pixel | whole-wave sections and lane reads by number (149 with `v_mbcnt` too) |
+| 302 | pixel | lane reads or writes by number (81 with first-lane reads) |
+| 37 | pixel | `v_mbcnt` (2 with first-lane reads) |
+| 150 | vertex | first-lane reads (1 with whole-wave sections) |
+| 8,762 | mesh | first-lane reads and `v_mbcnt` (17 with whole-wave sections) |
+
+This is a list of what *may* depend on the grouping, by instruction. The listing does not
+follow how a result is used: a vote that only skips work gives the same image. Lane reads
+by number in pixel programs are often SGPR spills parked in VGPR lanes. No program is shown
+wrong by it yet. The next step for graphics is one differential test per listed kind, the
+console's HLSL compiled both ways (`emit/diff_tests.rs` has the harness).
+
 ## Plan: the smallest steps, in order
 
 1. **Count the paths** (done: the census above). Add a census to `victory translate` of which lowering each
