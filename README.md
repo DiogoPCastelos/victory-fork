@@ -26,6 +26,8 @@ as they are, and every vector instruction runs once per bank.
   translation on a 32-lane GPU.
 - It is 1.6–6× faster than the split-in-halves path where that path needs barriers.
 
+Found a problem or ran it on your machine? See [CONTRIBUTING.md](CONTRIBUTING.md): open an issue with your full specs, `run.log` and screenshots.
+
 Details, numbers and what is still open: [docs/wave-audit.md](docs/wave-audit.md) and
 [docs/HANDOVER.md](docs/HANDOVER.md).
 

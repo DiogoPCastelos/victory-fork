@@ -1,0 +1,50 @@
+name: Run report
+description: How a run went on your machine, with your specs, run.log and screenshots
+title: "[Run] <GPU>, <RAM>: <what happened>"
+labels: ["run report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing. See [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md) for how to
+        get each item below. **Never upload the game's files** or anything copied out of them.
+  - type: textarea
+    id: specs
+    attributes:
+      label: Full specs
+      description: GPU model, dedicated GPU memory, driver version; CPU; RAM; page file; Windows version and build.
+      placeholder: |
+        GPU: RTX 4080, 16 GB dedicated, driver 5xx.xx
+        CPU: ...
+        RAM: 32 GB, page file system managed
+        Windows 11 23H2 (22631.xxxx)
+    validations:
+      required: true
+  - type: textarea
+    id: build
+    attributes:
+      label: Build and launch
+      description: The fork's commit (`git rev-parse --short HEAD`), release or diagnostics build, whether the cache was warmed (and with which values), the exact command line and any VICTORY_* variables.
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What you did and what you saw
+      description: How far it got (menus, cutscene, world), how long it ran, frame rate, what looks wrong and where, any crash or freeze.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: run.log
+      description: Drag run.log here (zip it if large). If it crashed, crashes.log from %LOCALAPPDATA%\victory\data too.
+    validations:
+      required: true
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots (picture and render layers)
+      description: A screenshot of the problem, plus for one or two world frames the captured picture (frame-<n>.png) and its render layers (frame-<n>-...-<width>x<height>-f<format>.png at the game's internal size; at least f27 and f28). Say which frame.
+    validations:
+      required: true
