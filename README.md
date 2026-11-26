@@ -98,6 +98,15 @@ Captures of frames and render targets need the diagnostics build
 (`cargo build --profile diag -p victory --features diagnostics`; see
 [docs/HANDOVER.md](docs/HANDOVER.md)).
 
+## Reporting a run
+
+Ran it? Please open an issue, whether it worked or not, following
+**[CONTRIBUTING.md](CONTRIBUTING.md)** (the issue form asks for the same):
+- your full specs: GPU and its dedicated memory, driver, CPU, RAM, page file, Windows build;
+- your `run.log`, uploaded;
+- screenshots in game: the picture and its render layers (base colour, normals, and the
+  rest), captured with the diagnostics build as CONTRIBUTING.md shows.
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its contributors: the
