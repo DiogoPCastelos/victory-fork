@@ -222,6 +222,8 @@ struct Lower<'a> {
     writes_uavs: bool,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
+    /// A DPP compare's lanes that write their bit ([`Lower::dpp`]; none: all).
+    dpp_enable: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
@@ -1706,6 +1708,7 @@ impl<'a> Lower<'a> {
             tail: vec![None; p.blocks.len()],
             writes_uavs,
             src0: None,
+            dpp_enable: None,
             console_lanes,
             split_lds,
             lds_meet,
@@ -6952,10 +6955,22 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("v_cmp_").or(name.strip_prefix("v_cmpx_")) {
-            let r = if v.dpp.is_some() {
-                Err("a compare with DPP")
-            } else {
-                self.compare(inst, rest)
+            // A compare with DPP: src0 as read from the lane DPP names, and the bits of the
+            // lanes DPP leaves unwritten clear ([`Self::dpp`]). Found as the reason one compute
+            // program did not translate on any host (the DPP compare lane tests).
+            let r = match v.dpp {
+                Some(d) => match self.dpp(inst, d) {
+                    Ok((x, enable)) => {
+                        self.src0 = Some(x);
+                        self.dpp_enable = enable;
+                        let r = self.compare(inst, rest);
+                        self.src0 = None;
+                        self.dpp_enable = None;
+                        r
+                    }
+                    Err(e) => Err(e),
+                },
+                None => self.compare(inst, rest),
             };
             if let Err(why) = r {
                 for &(_, w) in &inst.writes {
@@ -9386,6 +9401,12 @@ impl<'a> Lower<'a> {
                 self.s.m.cmp(c, p, a, b)
             }
             _ => return Err(inst.name()),
+        };
+        // a DPP compare: the lanes DPP leaves unwritten (a source past the row without
+        // bound_ctrl, a row or bank masked off) have their bit clear
+        let r = match self.dpp_enable {
+            Some(e) => self.s.m.bin(self.cur, Bin::And, r, e),
+            None => r,
         };
         self.lane_bits_for(inst, r);
         Ok(())

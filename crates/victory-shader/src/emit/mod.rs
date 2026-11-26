@@ -496,17 +496,40 @@ fn emit_any(
                 if std::env::var_os("VICTORY_DUAL_BANK").is_none_or(|v| v != "0") {
                     match crate::dualbank::transform(native) {
                         Ok(dual) => {
-                            let again = (|| {
-                                let p = crate::spill::build(&dual)?;
-                                let st = structure::structure(&p)?;
-                                let res = resource::track(&p, &dual.layout, dual.stage, Some(&st))?;
-                                let io = io::raise(&p, &dual)?;
-                                lower::with_dual_bank(|| emit_program(c, &dual, &p, &st, &io, &res))
-                            })();
-                            report("dual-bank", &again);
-                            if done(&again) {
-                                took("dual-bank (exact)");
-                                return again;
+                            // The rewritten program as it is, then in the forms the other
+                            // retries use: a skip of the console's (`s_cbranch_execz`) whose
+                            // scalar code the code after it reads (a sampler built inside
+                            // the region and read after it, seen in one compute program)
+                            // translates once the skip is left out.
+                            let lowered = |p: &ir::Program| -> Result<(HostShader, Option<u32>), ShaderError> {
+                                let st = structure::structure(p)?;
+                                let res = resource::track(p, &dual.layout, dual.stage, Some(&st))?;
+                                let io = io::raise(p, &dual)?;
+                                lower::with_dual_bank(|| emit_program(c, &dual, p, &st, &io, &res))
+                            };
+                            match crate::spill::build(&dual) {
+                                Ok(p) => {
+                                    let forms = [
+                                        ("dual-bank", Some(p.clone())),
+                                        ("dual-bank without early-outs", ir::without_early_outs(&p)),
+                                        ("dual-bank without skips", ir::without_skips(&p, false)),
+                                        ("dual-bank without skips, scalars followed", ir::without_skips(&p, true)),
+                                    ];
+                                    for (what, form) in forms {
+                                        let Some(form) = form else { continue };
+                                        let again = lowered(&form);
+                                        report(what, &again);
+                                        if done(&again) {
+                                            took("dual-bank (exact)");
+                                            return again;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    if why {
+                                        eprintln!("WAVE64-RETRY dual-bank: {e}");
+                                    }
+                                }
                             }
                         }
                         Err(e) => {

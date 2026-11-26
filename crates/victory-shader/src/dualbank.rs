@@ -222,7 +222,7 @@ fn rewrite(native: &NativeProgram) -> Result<NativeProgram, Why> {
     let mut starts = Vec::with_capacity(insts.len());
     // (word of a branch in `out`, the instruction index it goes to)
     let mut fixups: Vec<(usize, usize)> = Vec::new();
-    for i in &insts {
+    for (n, i) in insts.iter().enumerate() {
         if targets.contains(&i.offset) {
             out.real = None;
         }
@@ -237,6 +237,15 @@ fn rewrite(native: &NativeProgram) -> Result<NativeProgram, Why> {
                     None => None,
                 };
                 match name {
+                    // A skip: a forward `s_cbranch_execz` over straight-line code (no branch
+                    // inside, the target the region's end). The console's compiler inserts it to
+                    // save time; the code it skips is correct to run with no lane active, and
+                    // here every vector instruction of it runs under its bank's EXEC, so with
+                    // none active it does nothing. Left out: its scalar code then always runs,
+                    // as code after the region may read (a sampler built inside the region and
+                    // read after it, seen in one compute program). `VICTORY_DUAL_BANK_SKIPS=1`
+                    // keeps the branches.
+                    "s_cbranch_execz" if target.is_some_and(|t| t > n && straight(&insts[n + 1..t])) && !keep_skips() => {}
                     "s_cbranch_execz" | "s_cbranch_execnz" | "s_cbranch_vccz" | "s_cbranch_vccnz" => {
                         let pair = if name.contains("exec") { r.e } else { VCC_LO };
                         any_lane(&mut out, &r, pair)?;
@@ -721,6 +730,16 @@ fn vector(out: &mut Out, r: &Regs, i: &Instruction, name: &str) -> Result<(), Wh
     let cmpx = name.starts_with("v_cmpx");
     for b in 0..2u32 {
         out.exec(r.e + b, Some(b))?;
+        if i.encoding == Encoding::Vopc && w0 & 0x1FF == 0xFA && (cmpx || b == 1) {
+            dpp_compare(out, r, i, name, b, cmpx)?;
+            out.real = None;
+            continue;
+        }
+        if i.encoding == Encoding::Vopc && w0 & 0x1FF == 0xF9 && cmpx {
+            sdwa_compare(out, r, i, name, b)?;
+            out.real = None;
+            continue;
+        }
         let words = match i.encoding {
             Encoding::Vop3 | Encoding::Vop3p => bank_vop3(r, i, name, b)?,
             Encoding::Vopc => {
@@ -780,6 +799,87 @@ fn vector(out: &mut Out, r: &Regs, i: &Instruction, name: &str) -> Result<(), Wh
     Ok(())
 }
 
+/// A DPP16 control word (bits 31:28 the row mask, one bit per 16-lane row of the console's
+/// 64-lane wave) for bank `b` of a 32-lane host wave: bank 0 is the console's rows 0-1,
+/// bank 1 its rows 2-3, which are the host's rows 0-1. Rows 2-3 of a 32-lane wave do not
+/// exist; their bits are left clear.
+fn dpp_rows(ext: u32, b: u32) -> u32 {
+    let rows = ext >> 28 >> (2 * b) & 0x3;
+    ext & 0x0FFF_FFFF | rows << 28
+}
+
+/// A DPP16 compare (`v_cmp*_dpp`) for bank `b` where it cannot stay a VOPC (bank 1 writes
+/// `vcc_hi`, a `v_cmpx` writes its bank of the console EXEC): GFX10 has no VOP3 form with
+/// DPP, so the moved operand is made first and compared after.
+/// - `v_mov_b32` with the instruction's DPP (pattern, row and bank masks, bound_ctrl) puts
+///   src0 of the lane each lane reads into `vp`; the abs/neg modifiers move to the compare.
+/// - A lane whose DPP source is invalid (a masked row or bank, or an inactive source without
+///   bound_ctrl) is not written by the console's instruction: its result bit stays 0. A
+///   second DPP move of 1 into a zeroed `vq` marks the valid lanes, and a `v_cmpx` takes the
+///   others out of real EXEC for the compare (VALU only: SCC and VCC are left alone).
+/// - The compare in VOP3 form writes the bank's 32 bits of VCC (or of the console EXEC for
+///   `v_cmpx`); lanes outside real EXEC get 0, as on the console.
+fn dpp_compare(out: &mut Out, r: &Regs, i: &Instruction, name: &str, b: u32, cmpx: bool) -> Result<(), Why> {
+    let (w0, ext) = (i.words[0], i.words[1]);
+    let add = b * r.k;
+    let src0 = (ext & 0xFF) + add;
+    let vsrc1 = (w0 >> 9 & 0xFF) + add;
+    let (row_mask, bank_mask, bound_ctrl) = (ext >> 28, ext >> 24 & 0xF, ext >> 19 & 1 == 1);
+    let mov = op(Encoding::Vop1, "v_mov_b32")?;
+    // the DPP word without src0 and without abs/neg (bits 20-23): those go to the compare
+    let dpp = dpp_rows(ext, b) & !0xFF & !(0xF << 20);
+    out.push(&[0x7E00_0000 | r.vp << 17 | mov << 9 | 0xFA, dpp | src0]);
+    let checks_lanes = !bound_ctrl || row_mask != 0xF || bank_mask != 0xF;
+    if checks_lanes {
+        // vq = 1 where the lane's DPP source is valid, 0 elsewhere (the move writes nothing
+        // there): the same DPP, from vz = 1, without bound_ctrl
+        out.vop1("v_mov_b32", r.vq, int(0))?;
+        out.vop1("v_mov_b32", r.vz, int(1))?;
+        out.push(&[0x7E00_0000 | r.vq << 17 | mov << 9 | 0xFA, dpp & !(1 << 19) | r.vz]);
+        out.vopc("v_cmpx_ne_u32", int(0), r.vq)?;
+    }
+    let to = if cmpx { r.e + b } else { VCC_LO + b };
+    let cmp = if cmpx { name.replacen("v_cmpx_", "v_cmp_", 1) } else { name.to_owned() };
+    let o = op(Encoding::Vop3, &cmp)?;
+    // DPP's modifiers: neg src0 bit 20, abs src0 21, neg src1 22, abs src1 23
+    let neg = (ext >> 20 & 1) | (ext >> 22 & 1) << 1;
+    let abs = (ext >> 21 & 1) | (ext >> 23 & 1) << 1;
+    out.push(&[0xD400_0000 | o << 16 | abs << 8 | to, (256 + r.vp) | (256 + vsrc1) << 9 | neg << 29]);
+    Ok(())
+}
+
+/// An SDWA `v_cmpx` for bank `b`: it writes the console EXEC, which here is the pair `E`, not
+/// real EXEC, and GFX10's SDWA compares have no form that writes an SGPR as a `v_cmpx`. So
+/// each operand's selected byte or word (with its sign extension) is first moved into a
+/// scratch VGPR by `v_mov_b32` SDWA (`vp` for src0, `vq` for src1; an operand may be an
+/// SGPR), and a VOP3 compare of the two writes the bank's 32 bits of the console EXEC, with
+/// SDWA's abs/neg modifiers. Lanes outside real EXEC get 0, as `v_cmpx` gives them.
+fn sdwa_compare(out: &mut Out, r: &Regs, i: &Instruction, name: &str, b: u32) -> Result<(), Why> {
+    let (w0, ext) = (i.words[0], i.words[1]);
+    let add = b * r.k;
+    let mov = op(Encoding::Vop1, "v_mov_b32")?;
+    // src0: bits 7:0, sel 18:16, sext 19, an SGPR when bit 23 is set
+    let (s0_sgpr, s1_sgpr) = (ext >> 23 & 1 == 1, ext >> 31 == 1);
+    let src0 = if s0_sgpr { data(r, ext & 0xFF) } else { (ext & 0xFF) + add };
+    let sel0 = ext >> 16 & 0xF; // sel and sext
+    // src1: the VOPC's vsrc1 field, sel 26:24, sext 27, an SGPR when bit 31 is set
+    let v1 = w0 >> 9 & 0xFF;
+    let src1 = if s1_sgpr { data(r, v1) } else { v1 + add };
+    let sel1 = ext >> 24 & 0xF;
+    // v_mov_b32 SDWA: dst_sel dword (6), dst_unused pad (0), src0_sel and sext, s0
+    let sdwa_mov = |dst: u32, reg: u32, sel: u32, sgpr: bool| {
+        [0x7E00_0000 | dst << 17 | mov << 9 | 0xF9, reg | 6 << 8 | sel << 16 | u32::from(sgpr) << 23]
+    };
+    out.push(&sdwa_mov(r.vp, src0, sel0, s0_sgpr));
+    out.push(&sdwa_mov(r.vq, src1, sel1, s1_sgpr));
+    let o = op(Encoding::Vop3, &name.replacen("v_cmpx_", "v_cmp_", 1))?;
+    // SDWA's modifiers: neg src0 bit 20, abs src0 21, neg src1 28, abs src1 29
+    let neg = (ext >> 20 & 1) | (ext >> 28 & 1) << 1;
+    let abs = (ext >> 21 & 1) | (ext >> 29 & 1) << 1;
+    out.push(&[0xD400_0000 | o << 16 | abs << 8 | (r.e + b), (256 + r.vp) | (256 + r.vq) << 9 | neg << 29]);
+    Ok(())
+}
+
 /// VOP2 instructions that read (and the `_co_ci` ones write) VCC without naming it.
 fn implicit_vcc(name: &str) -> bool {
     name == "v_cndmask_b32" || name.ends_with("_co_ci_u32")
@@ -812,6 +912,9 @@ fn bank_short(r: &Regs, i: &Instruction, b: u32) -> Vec<u32> {
         }
         0xFA | 0xE9 | 0xEA => {
             bank_byte(&mut words, 1, 0, add);
+            if src0 == 0xFA {
+                words[1] = dpp_rows(words[1], b);
+            }
             if !vop1 {
                 let v1 = w >> 9 & 0xFF;
                 w = w & !(0xFF << 9) | (v1 + add) << 9;
@@ -909,4 +1012,62 @@ mod tests {
         assert_eq!(mask(&r, NULL, 1), NULL);
         assert_eq!((data(&r, EXEC_LO), data(&r, EXEC_HI)), (20, 21));
     }
+}
+
+/// Debugging aid: `VICTORY_DUAL_DUMP=<container.cdxil>,<byte offset>` prints the rewritten
+/// program's instructions around that offset (the compute program of the container).
+#[cfg(test)]
+#[test]
+#[ignore = "debugging aid"]
+fn dump_rewrite_around() {
+    let Ok(spec) = std::env::var("VICTORY_DUAL_DUMP") else { return };
+    let (path, at) = spec.split_once(',').expect("<file>,<offset>");
+    let at = usize::from_str_radix(at.trim_start_matches("0x"), 16).expect("hex offset");
+    let bytes = std::fs::read(path).expect("container");
+    let c = crate::Container::parse(&bytes).expect("container");
+    let part = c.part(crate::FourCC::DXIL).expect("DXIL part");
+    let native = crate::native_programs(part.data).expect("programs").into_iter().find(|p| p.stage == HwStage::Cs).expect("compute");
+    let dual = rewrite(&native).expect("rewrite");
+    for i in gfx10::decode(&dual.code).expect("decode") {
+        if i.offset + 0x80 >= at && i.offset <= at + 0x40 {
+            println!("{:#06x}{} {}", i.offset, if i.offset == at { " >>" } else { "   " }, i.text(false));
+        }
+    }
+}
+
+/// Debugging aid: `VICTORY_DUAL_DUMP_ORIG=<container.cdxil>,<name>` prints the original
+/// program's instructions before the first instruction of that name.
+#[cfg(test)]
+#[test]
+#[ignore = "debugging aid"]
+fn dump_original_before() {
+    let Ok(spec) = std::env::var("VICTORY_DUAL_DUMP_ORIG") else { return };
+    let (path, name) = spec.split_once(',').expect("<file>,<name>");
+    let bytes = std::fs::read(path).expect("container");
+    let c = crate::Container::parse(&bytes).expect("container");
+    let part = c.part(crate::FourCC::DXIL).expect("DXIL part");
+    let native = crate::native_programs(part.data).expect("programs").into_iter().find(|p| p.stage == HwStage::Cs).expect("compute");
+    let insts = gfx10::decode(&native.code).expect("decode");
+    let at = insts.iter().position(|i| i.name() == Some(name)).expect("instruction");
+    for i in &insts[at.saturating_sub(22)..=at + 1] {
+        println!("{:#06x}  {}", i.offset, i.text(true));
+    }
+}
+
+/// Whether `region` has no branch, no end of program and no scalar memory store or message
+/// (code a skip may jump over and run all the same).
+fn straight(region: &[Instruction]) -> bool {
+    region.iter().all(|i| {
+        let name = i.name().unwrap_or("");
+        branch_target(i).is_none()
+            && !matches!(name, "s_endpgm" | "s_setpc_b64" | "s_swappc_b64")
+            && !name.starts_with("s_sendmsg")
+            && !(i.encoding == Encoding::Smem && (name.contains("store") || name.contains("atomic")))
+    })
+}
+
+/// `VICTORY_DUAL_BANK_SKIPS=1`: skips are kept as branches ([`rewrite`]).
+fn keep_skips() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DUAL_BANK_SKIPS").is_some_and(|v| v == "1"))
 }

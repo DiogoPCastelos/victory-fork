@@ -1001,3 +1001,98 @@ fn dual_bank_a_loop_with_an_if_inside_runs_each_lane_its_own_count() {
     a_loop_with_an_if_inside_runs_each_lane_its_own_count();
     DUAL.set(false);
 }
+
+/// The model of a DPP16 `row_shr:n` compare `src0 > vsrc1` (unsigned) over a 64-lane wave:
+/// lane l reads src0 of lane l - n in its row of 16; a lane whose source is past the row's
+/// start takes 0 with bound_ctrl, else is not written (its bit 0); rows off in `rows` and
+/// lanes outside EXEC are not written either. Returns the bits, and the lanes not claimed:
+/// a source lane in the row but outside EXEC (with FI clear the ISA treats it as out of
+/// range; the translator reads it as it is; not settled, so not compared).
+fn dpp_shr_compare(src0: &[u32; 64], vsrc1: &[u32; 64], n: usize, bound: bool, rows: u32, exec: u64) -> (u64, u64) {
+    let (mut bits, mut unknown) = (0u64, 0u64);
+    for l in 0..64 {
+        if !model::active(exec, l) || rows >> (l / 16) & 1 == 0 {
+            continue;
+        }
+        let from = (l % 16).checked_sub(n).map(|k| l / 16 * 16 + k);
+        let value = match from {
+            Some(s) if model::active(exec, s) => Some(src0[s]),
+            Some(_) => {
+                unknown |= 1 << l;
+                continue;
+            }
+            None if bound => Some(0),
+            None => None,
+        };
+        if value.is_some_and(|v| v > vsrc1[l]) {
+            bits |= 1 << l;
+        }
+    }
+    (bits, unknown)
+}
+
+/// `v_cmp_gt_u32` (or `v_cmpx_gt_u32`) with DPP16 `row_shr:1` on src0 = the lane number,
+/// vsrc1 = s0, under EXEC = s[2:3]. The compare: VCC's two halves at dwords 0 and 1. The
+/// `v_cmpx`: v12 = 1 in the lanes the new EXEC keeps.
+fn dpp_compare_program(cmpx: bool, bound: bool, rows: u32) -> Vec<u32> {
+    let ext = 2 | 0x111 << 8 | u32::from(bound) << 19 | 0xF << 24 | rows << 28; // src0 v2, row_shr:1
+    let mut w = prologue();
+    w.push(vop1(V_MOV_B32, 2, v(0)));
+    w.push(vop1(V_MOV_B32, 4, 0)); // v4 = s0
+    w.push(sop1(S_MOV_B64, EXEC, 2));
+    let op = if cmpx { V_CMPX_GT_U32 } else { 0xC4 };
+    w.push(0x7C00_0000 | op << 17 | 4 << 9 | 0xFA);
+    w.push(ext);
+    if cmpx {
+        w.push(vop1(V_MOV_B32, 12, int(1)));
+        epilogue(&mut w);
+    } else {
+        w.push(sop1(S_MOV_B64, EXEC, 22));
+        w.push(vop1(V_MOV_B32, 3, VCC_LO));
+        w.push(vop1(V_MOV_B32, 5, VCC_HI));
+        w.extend(store_at(3, 0));
+        w.extend(store_at(5, 4));
+    }
+    w
+}
+
+#[test]
+fn a_dpp_compare_reads_its_row_neighbour() {
+    let _one = one_at_a_time();
+    let lanes: [u32; 64] = std::array::from_fn(|l| l as u32);
+    for cmpx in [false, true] {
+        for (bound, rows) in [(true, 0xF), (false, 0xF), (true, 0b0101), (false, 0b1010)] {
+            let what = format!("DPP row_shr:1 {} bound_ctrl {bound} rows {rows:#06b}", if cmpx { "v_cmpx" } else { "v_cmp" });
+            let Some(card) = card(&what, &dpp_compare_program(cmpx, bound, rows)) else { return };
+            let mut rng = Rng(0x5EED_0000_0000_0009 + u64::from(rows) + u64::from(bound) * 16 + u64::from(cmpx) * 32);
+            for case in 0..24 {
+                let exec = if case < 2 { u64::MAX } else { rng.next() };
+                let threshold = [0u32, 7, 20, 40][case % 4];
+                let (lo, hi) = split(exec);
+                let got = card.run([threshold, 0, lo, hi]);
+                let (want, unknown) = dpp_shr_compare(&lanes, &[threshold; 64], 1, bound, rows, exec);
+                if cmpx {
+                    let expect: [Option<u32>; 64] = std::array::from_fn(|l| {
+                        (unknown >> l & 1 == 0).then_some(if want >> l & 1 == 1 { 1 } else { DEAD })
+                    });
+                    compare(&format!("{what}, exec {exec:#x}, s0 {threshold}"), &got, &expect);
+                } else {
+                    let got64 = u64::from(got[0]) | u64::from(got[1]) << 32;
+                    assert_eq!(
+                        got64 & !unknown,
+                        want,
+                        "{what}, exec {exec:#x}, s0 {threshold}: VCC (lanes {unknown:#x} not compared)"
+                    );
+                }
+            }
+            eprintln!("{what}: 24 cases as the model");
+        }
+    }
+}
+
+#[test]
+fn dual_bank_a_dpp_compare_reads_its_row_neighbour() {
+    DUAL.set(true);
+    a_dpp_compare_reads_its_row_neighbour();
+    DUAL.set(false);
+}
