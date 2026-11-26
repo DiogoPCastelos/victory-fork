@@ -107,6 +107,30 @@ shaders and emulates the one instruction.
   through an edge.
 - Cost on the GPU is unmeasured.
 
+## What the title asks of its builder (trace, 2026-11-26)
+
+The title calls the builder's C++ class in `XboxBvhBuilder.dll` directly
+(the executable imports its constructor, destructor, batched build,
+rehydrate, prebuild info, copy and `Set64BitMortonCodes`).
+`VICTORY_BVH_TRACE=1` (off by default) logs each of the four working calls
+and passes it on unchanged. One world run with the builder off (RTX 3060
+laptop):
+
+- **Rehydrate** (144 calls, batches of 16): bottom-level structures
+  unpacked in place (destination = source), flags `0x14` (prefer fast trace,
+  minimize memory), no scratch, 1 to 28 geometry descriptions each: the
+  static world's prebuilt structures, which the walkers light with today.
+- **Batched build** (248 calls, batches of up to 16): bottom-level
+  structures built from meshes, flags such as `0xb` (allow update, allow
+  compaction, prefer fast build): the dynamic geometry. The descriptor is
+  not public; it repeats every 80 bytes (destination; type in the low dword
+  and flags in the high; description count and address; scratch; a pointer).
+  Every scratch range seen lies in one 64 MiB buffer.
+- **Prebuild info** (4,352 calls): bottom levels of 1 KiB to 10 MiB with up
+  to 4 MiB of scratch; top levels of up to 32,768 instances (12 MiB of result,
+  3.7 MiB of scratch). These are the bounds a builder stage must keep to.
+- **Copy**: none.
+
 ## Where to look
 
 - `crates/victory-shader/src/bvh.rs`: the reference for the node test.

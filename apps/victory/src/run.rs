@@ -222,6 +222,12 @@ fn watch(base: usize, size: usize) {
 /// DLLs the host or our runtime provide are never taken from the title.
 #[cfg(windows)]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
+    // A DLL the runtime only wraps (`VICTORY_BVH_TRACE`) is still the title's:
+    // the wrapped calls go on to it, the others resolve to it.
+    #[cfg(windows)]
+    if victory_hle::modules::bvhtrace::wraps(dll) {
+        return true;
+    }
     !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
 }
 

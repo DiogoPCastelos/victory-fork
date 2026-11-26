@@ -3176,6 +3176,15 @@ impl State {
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             return false;
         }
+        // Diagnostics: a builder stage past `VICTORY_BVH_STAGES` is held back
+        // here too, as a direct dispatch is: a stage bisect excludes the
+        // indirect work of the stages it holds.
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_builder(self.pipeline as This) && crate::pipeline::builder_stage_held(self.pipeline as This) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_why("a builder stage past VICTORY_BVH_STAGES (indirect)".to_owned());
+            return false;
+        }
         // A program that walks ray-tracing structures nothing has built:
         // dropped before the argument clamp, like a skipped one.
         if crate::pipeline::walk_held(self.pipeline as This) {
@@ -3468,6 +3477,11 @@ impl State {
         };
         if !ran {
             why("prepare failed");
+            // A stage of the structure builder that cannot be bound is a
+            // dropped stage: the others stop too, as for a direct dispatch.
+            if kind == DISPATCH && crate::pipeline::is_builder(self.pipeline as This) {
+                crate::pipeline::builder_off("one of its indirect dispatches could not be bound");
+            }
             return false;
         }
         #[cfg(feature = "diagnostics")]
