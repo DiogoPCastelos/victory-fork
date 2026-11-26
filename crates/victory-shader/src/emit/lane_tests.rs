@@ -1191,3 +1191,7 @@ fn dual_bank_branches_out_of_reach_after_the_rewrite_go_as_far_jumps() {
     branches_out_of_reach_after_the_rewrite_go_as_far_jumps();
     DUAL.set(false);
 }
+
+/// Far jumps in the dual-bank rewrite, each property against a CPU model of the program.
+#[path = "far_jump_tests.rs"]
+mod far_jumps;

@@ -1054,6 +1054,29 @@ mod tests {
         assert_eq!(stages, [HwStage::Es, HwStage::Vs]);
     }
 
+    /// Regressions for kind 0x0c: a packed and a plain blob in one part are both read, in
+    /// part order (each program once); a plain `FSSM` cut short or whose entry runs past the
+    /// part is an error, not an empty list; a plain blob with no programs gives none.
+    #[test]
+    fn unpacked_blobs_beside_packed_ones() {
+        let vs = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let ps = fssm(&[(HwStage::Ps, &PS_CODE)]);
+        let both = native_programs(&part(&[(KIND_NATIVE, &xbch(&vs)), (KIND_NATIVE_PLAIN, &ps)])).unwrap();
+        assert_eq!(both.iter().map(|p| p.stage).collect::<Vec<_>>(), [HwStage::Vs, HwStage::Ps]);
+        let swapped = native_programs(&part(&[(KIND_NATIVE_PLAIN, &ps), (KIND_NATIVE, &xbch(&vs))])).unwrap();
+        assert_eq!(swapped.iter().map(|p| p.stage).collect::<Vec<_>>(), [HwStage::Ps, HwStage::Vs]);
+        assert_eq!(both[0].code, VS_CODE);
+        assert_eq!(both[1].code, PS_CODE);
+        // cut short: the header promises more payload than there is
+        let short = &vs[..vs.len() - 3];
+        assert!(native_programs(&part(&[(KIND_NATIVE_PLAIN, short)])).is_err());
+        // an entry running past the part
+        let mut past = part(&[(KIND_NATIVE_PLAIN, &vs)]);
+        past.truncate(past.len() - 4);
+        assert!(native_programs(&past).is_err());
+        assert!(native_programs(&part(&[(KIND_NATIVE_PLAIN, &fssm(&[]))])).unwrap().is_empty());
+    }
+
     /// An `FSSM` stored as it is (kind 0x0c, beside a hash and a program header) gives the
     /// programs its packed form gives; other data under that kind is not read, and a damaged
     /// `FSSM` is still an error.

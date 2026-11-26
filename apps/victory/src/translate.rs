@@ -571,6 +571,14 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                             let path = path_of(&p);
                             if t.list {
                                 t.lines.push(format!("{}  path: {path}; vgprs {}, {} instructions", label(), p.vgprs, program.blocks.iter().map(|b| b.insts.len()).sum::<usize>()));
+                                // lane-mask branches whose per-lane form is not the console's
+                                // (`victory_shader::lane_exact`), in the console program
+                                let inexact = victory_shader::lane_exact::inexact(&program, &s);
+                                if !inexact.is_empty() {
+                                    let mut why: Vec<&str> = inexact.iter().map(|i| i.why).collect();
+                                    why.dedup();
+                                    t.lines.push(format!("{}  per-lane branches not exact: {} ({})", label(), inexact.len(), why.join("; ")));
+                                }
                             }
                             t.paths.entry(path).or_insert_with(|| (0, label())).0 += 1;
                             if p.wave64 && p.stage != HwStage::Cs {

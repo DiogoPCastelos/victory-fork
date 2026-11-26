@@ -156,14 +156,22 @@ impl Out {
 /// Which branches the growth puts out of reach is known only once the code is laid out: the
 /// rewrite is done again with those as far jumps until every branch reaches.
 pub fn transform(native: &NativeProgram) -> Result<NativeProgram, ShaderError> {
+    transform_in_rounds(native).map(|(p, _)| p)
+}
+
+/// [`transform`], with the number of times the rewrite was done (1: every branch reached the
+/// first time).
+pub(crate) fn transform_in_rounds(native: &NativeProgram) -> Result<(NativeProgram, usize), ShaderError> {
     let mut far = std::collections::HashSet::new();
-    loop {
+    for round in 1.. {
         let mut out_of_reach = Vec::new();
         match rewrite(native, &far, &mut out_of_reach) {
+            // (each round makes at least one more branch far, so this ends)
             Err(TOO_FAR) if out_of_reach.iter().any(|n| !far.contains(n)) => far.extend(out_of_reach),
-            r => return r.map_err(|what| ShaderError::Unsupported { offset: 0, what }),
+            r => return r.map(|p| (p, round)).map_err(|what| ShaderError::Unsupported { offset: 0, what }),
         }
     }
+    unreachable!()
 }
 
 const TOO_FAR: Why = "dual-bank: a branch too far after the rewrite";
@@ -212,12 +220,20 @@ fn title_far_jumps(
             && w >> 16 & 0x7F == pair
             && w & 0xFF == pair
             && w >> 8 & 0xFF == LITERAL;
-        let carries = matches!(carry.name(), Some("s_addc_u32" | "s_subb_u32")) && carry.words[0] >> 16 & 0x7F == pair + 1;
+        let sub = add.name() == Some("s_sub_u32");
+        let literal = i64::from(add.words[1] as i32);
+        // the high word takes the literal's sign (0 or -1), so the 64-bit offset is the
+        // literal sign-extended: anything else is not read as a far jump (and is refused as
+        // a program-counter instruction)
+        let high = if literal < 0 { MINUS_ONE } else { int(0) };
+        let c = carry.words[0];
+        let carries = carry.name() == Some(if sub { "s_subb_u32" } else { "s_addc_u32" })
+            && carry.words.len() == 1
+            && c >> 16 & 0x7F == pair + 1
+            && (c & 0xFF == pair + 1 && c >> 8 & 0xFF == high || !sub && c & 0xFF == high && c >> 8 & 0xFF == pair + 1);
         if !adds || !carries || getpc.words[0] >> 16 & 0x7F != pair {
             continue;
         }
-        let sub = add.name() == Some("s_sub_u32");
-        let literal = i64::from(add.words[1] as i32);
         // s_getpc_b64 gives the address of the instruction after it
         let target = getpc.offset as i64 + 4 + if sub { -literal } else { literal };
         let t = usize::try_from(target)
@@ -450,11 +466,16 @@ fn rewrite(
     let offset = |getpc: usize, t: usize| 4 * starts[t] as i64 - 4 * (getpc as i64 + 1);
     for (getpc, literal, t, sub) in title_fixups {
         let delta = offset(getpc, t);
-        out.words[literal] = (if sub { -delta } else { delta }) as i32 as u32;
+        let new = i32::try_from(if sub { -delta } else { delta }).map_err(|_| "dual-bank: a far jump over 2 GiB")?;
+        // (the program's high word stays: the order of instructions is kept, so the sign is)
+        if (new < 0) != ((out.words[literal] as i32) < 0) {
+            return Err("dual-bank: a far jump whose direction changed in the rewrite");
+        }
+        out.words[literal] = new as u32;
     }
     for (getpc, literal, carry, t) in far_fixups {
         let delta = offset(getpc, t);
-        out.words[literal] = delta as i32 as u32;
+        out.words[literal] = i32::try_from(delta).map_err(|_| "dual-bank: a far jump over 2 GiB")? as u32;
         let high = if delta < 0 { MINUS_ONE } else { int(0) };
         out.words[carry] = out.words[carry] & !0xFF00 | high << 8;
     }

@@ -13,6 +13,7 @@ pub mod dxil;
 pub mod emit;
 pub mod gfx10;
 pub mod io;
+pub mod lane_exact;
 pub mod ir;
 pub mod native;
 pub mod resource;

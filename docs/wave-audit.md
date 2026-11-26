@@ -251,6 +251,62 @@ Not seen yet in a game run.
 
 All of them pass on the RTX 3060 through both the paired and the dual-bank path.
 
+### Far jumps against a CPU model of the program (2026-11-26)
+
+`emit/far_jump_tests.rs` runs each program's own words on a small CPU interpreter of the
+GFX10 subset the tests use (written from the public ISA; it shares only the opcode tables
+with the translator). It then runs them on the RTX 3060 in both 32-lane forms and compares
+every thread. There is one test per property:
+
+- forward jumps (`scc1`, `scc0`, an if/else closed by `s_branch`, and the program's own far
+  jump);
+- backward jumps (loops closed by `scc1`, by `s_branch`, by the program's far jump
+  subtracting, and by one adding a negative offset with a carry of -1);
+- SCC kept across far `scc1`, `scc0`, `s_branch` and `execz`;
+- the rewrite's scratch SGPRs, which never overlap SGPRs the program names (s24-s105, VCC
+  and M0 live across; or ttmp0-1 named), plus a refusal when none is free;
+- divergent EXEC: `execz`, `vccz`, `execnz` and `vccnz` under masks in one half only, lane
+  31 or 32 only, none, all, and random ones;
+- branch relaxation in rounds: four rewrites and three far jumps, conditional and
+  unconditional;
+- groups of 96, 128 and 192 threads.
+
+The program's own far jump is now read only when its carry has the literal's sign: the
+64-bit offset is then the literal sign-extended. A far jump whose direction or reach changes
+in the rewrite is refused.
+
+**Found by the divergent-EXEC test (both 32-lane forms): per-lane branches that are not the
+console's** (`lane_exact.rs`). The structurer makes `s_cbranch_exec*`/`vcc*` per-lane, and
+that differs from the console in two cases:
+
+- **A scalar written in a region only some lanes run, then read after it.** Each lane then
+  keeps its own copy. A loop counter read after a lane-mask loop is one example.
+- **A `vccz`/`vccnz` over unmasked vector code when VCC differs between active lanes.**
+  Compilers emit that branch only for conditions they know to be uniform
+  (`s_and_b64 vcc, exec, m`), so the analysis does not count it.
+
+`lane_exact::inexact` finds the first case. It follows plain copies, since the compiler parks
+a scalar and moves it back, and it leaves out lane masks.
+
+The translator does not act on it yet: the census lists these programs per program
+("per-lane branches not exact"; 1,373 programs), and their translation is unchanged. Where
+the far-jump tests' programs have such branches, the paired form is not run and the
+dual-bank form's differences are reported, not asserted.
+
+Three steps were tried and taken out again (2026-11-26). Game runs with all three showed a
+black world after the menus. Each changed programs the opening binds (census against the
+far-jump fix alone; the bound programs are the union of four runs' first binds):
+
+- Sending a compute program with such a branch to an exact form first. Wave32 programs then
+  took those branches wave-wide (1,024 programs, 337 bound), and one console wave64 program
+  went dual-bank.
+- Dual-bank taking every lane-mask branch wave-wide (all 51 dual-bank programs, 19 bound).
+- `v_readlane_b32` with a constant lane taken `& (wave - 1)` of the console wave: 430 pixel
+  and 49 wave32 compute programs changed, 36 pixel programs bound. That is a no-op for the
+  lane read, so it did not do what its comment said.
+
+Which of them, if any, caused the black world is not known. Each needs its own game check.
+
 ### Paired against dual-bank (handover milestone 5)
 
 `bench_paired_against_dual_bank` (an ignored test: `cargo test -p victory-shader --lib

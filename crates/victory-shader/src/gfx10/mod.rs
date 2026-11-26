@@ -299,6 +299,7 @@ pub fn opcode(encoding: Encoding, name: &str) -> Option<u16> {
     };
     match encoding {
         Encoding::Sop2 => find(t::SOP2, 0),
+        Encoding::Sopk => find(t::SOPK, 0),
         Encoding::Sop1 => find(t::SOP1, 0),
         Encoding::Sopc => find(t::SOPC, 0),
         Encoding::Sopp => find(t::SOPP, 0),
@@ -310,6 +311,7 @@ pub fn opcode(encoding: Encoding, name: &str) -> Option<u16> {
             .or_else(|| find(t::VOP2, 0x100))
             .or_else(|| find(t::VOP1, 0x180)),
         Encoding::Ds => find(t::DS, 0),
+        Encoding::Mubuf => find(t::MUBUF, 0),
         _ => None,
     }
 }
