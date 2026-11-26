@@ -76,17 +76,17 @@ $env:VICTORY_CAPTURE = $runDir
 $env:VICTORY_CAPTURE_WORLD = 1
 $env:VICTORY_CAPTURE_WORLD_ALSO = "60,150,300"
 $env:VICTORY_DUMP_TARGETS = 1
-$env:VICTORY_BVH_BUILDER = 1   # ray tracing: also build the dynamic structures (characters, moving objects)
 $env:VICTORY_TEXTURE_BACK = 1   # water: textures the game reads back on the CPU are copied back (boats float)
 Write-Host "Saving this run to $runDir"
 target\diag\victory.exe run "<game folder>\<the game's .exe>" --execute > "$runDir\run.log" 2>&1
 ```
 
 **Ray tracing.** The game lights interiors, bounce light and its lamp and sun shadows by
-ray tracing. The static world's ray tracing runs by default. `VICTORY_BVH_BUILDER=1` adds
-the builder of the dynamic structures, so characters and moving objects are ray traced
-too. The builder is new: if a run crashes or runs out of memory soon after the world
-appears, say so in your report and try once more without that line
+ray tracing. The static world's ray tracing runs by default, with the commands above.
+Optional, for PCs with plenty of memory: `$env:VICTORY_BVH_BUILDER = 1` before the run
+adds the builder of the dynamic structures, so characters and moving objects are ray
+traced too. On a 16 GB PC it runs out of memory seconds after the world appears; if a run
+with it crashes, say so in your report and run again without it
 (`Remove-Item Env:VICTORY_BVH_BUILDER`).
 
 Press Enter through the menus. The first launch also builds the GPU's pipelines (minutes in

@@ -27,12 +27,11 @@ Read `docs/XBOX_SERIES_GPU_TRANSLATION.md` in full, then `docs/wave-audit.md` (w
 A minimal compute test running on a verified 32-lane host correctly transfers guest lane 31's value to lane 32 and vice versa, matches the CPU reference for the supported operation subset, and never issues a barrier with illegal participation. A Wave32 shader that does not need emulation remains on the native path. Unsupported graphics shaders receive clear diagnostics, not silent approximations. Game compatibility is a later milestone requiring actual authorized title data and broader subsystem integration.
 
 ## Running the game
-Run it with ray tracing on: the static world's ray tracing runs by default, and `VICTORY_BVH_BUILDER=1` adds the builder of the dynamic structures (characters, moving objects). Warm the cache first with the same build (README, step 2).
+The static world's ray tracing runs by default; the command below is the one a world run last worked with on the RTX 3060 laptop (16 GB). Warm the cache first with the same build (README, step 2). `VICTORY_BVH_BUILDER=1` adds the builder of the dynamic structures (characters, moving objects); on 16 GB it runs out of memory seconds after the world appears.
 
 ```powershell
-$env:VICTORY_BVH_BUILDER = 1
 $env:VICTORY_TEXTURE_BACK = 1
 target\diag\victory.exe run "<game folder>\<the game's .exe>" --execute > "<a folder outside the repo>\run.log" 2>&1
 ```
 
-If a run crashes or runs out of memory soon after the world appears, report it and run once more without `VICTORY_BVH_BUILDER`. Never hold the ray-tracing walkers (`VICTORY_BVH_HOLD`) in a normal run: they light the world.
+If a run with the builder crashes or runs out of memory soon after the world appears, report it and run once more without it. Never hold the ray-tracing walkers (`VICTORY_BVH_HOLD`) in a normal run: they light the world.
