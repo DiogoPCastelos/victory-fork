@@ -36,6 +36,7 @@ Run with the output saved to a file:
 
 ```powershell
 $env:VICTORY_BVH_BUILDER = 1   # ray tracing of characters and moving objects too (README, "Ray tracing")
+$env:VICTORY_TEXTURE_BACK = 1   # water: textures the game reads back on the CPU are copied back (boats float)
 target\release\victory.exe run "<game folder>\<the game's .exe>" --execute > run.log 2>&1
 ```
 
@@ -64,6 +65,7 @@ $env:VICTORY_CAPTURE_WORLD = 1                      # a few frames once the worl
 $env:VICTORY_CAPTURE_WORLD_ALSO = "60,150,300"      # and these many frames into the world
 $env:VICTORY_DUMP_TARGETS = 1                       # every render layer of those frames
 $env:VICTORY_BVH_BUILDER = 1                        # ray tracing of characters and moving objects too
+$env:VICTORY_TEXTURE_BACK = 1                       # water: boats float
 target\diag\victory.exe run "<game folder>\<the game's .exe>" --execute > run.log 2>&1
 ```
 

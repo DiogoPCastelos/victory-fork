@@ -31,6 +31,7 @@ Run it with ray tracing on: the static world's ray tracing runs by default, and 
 
 ```powershell
 $env:VICTORY_BVH_BUILDER = 1
+$env:VICTORY_TEXTURE_BACK = 1
 target\diag\victory.exe run "<game folder>\<the game's .exe>" --execute > "<a folder outside the repo>\run.log" 2>&1
 ```
 

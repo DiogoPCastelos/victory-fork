@@ -77,6 +77,7 @@ $env:VICTORY_CAPTURE_WORLD = 1
 $env:VICTORY_CAPTURE_WORLD_ALSO = "60,150,300"
 $env:VICTORY_DUMP_TARGETS = 1
 $env:VICTORY_BVH_BUILDER = 1   # ray tracing: also build the dynamic structures (characters, moving objects)
+$env:VICTORY_TEXTURE_BACK = 1   # water: textures the game reads back on the CPU are copied back (boats float)
 Write-Host "Saving this run to $runDir"
 target\diag\victory.exe run "<game folder>\<the game's .exe>" --execute > "$runDir\run.log" 2>&1
 ```
