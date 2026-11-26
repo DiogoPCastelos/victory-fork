@@ -35,8 +35,12 @@ Memory: total and "Committed").
 Run with the output saved to a file:
 
 ```powershell
+$env:VICTORY_BVH_BUILDER = 1   # ray tracing of characters and moving objects too (README, "Ray tracing")
 target\release\victory.exe run "<game folder>\<the game's .exe>" --execute > run.log 2>&1
 ```
+
+Say in the report whether `VICTORY_BVH_BUILDER=1` was set. The static world's ray tracing
+runs either way.
 
 Play until the problem shows (or the world loads), close the window, and upload `run.log`
 to the issue. Zip it if it is large. If it crashed, also upload `crashes.log` from
@@ -59,6 +63,7 @@ $env:VICTORY_CAPTURE = "C:\victory-captures"        # any folder OUTSIDE the rep
 $env:VICTORY_CAPTURE_WORLD = 1                      # a few frames once the world shows
 $env:VICTORY_CAPTURE_WORLD_ALSO = "60,150,300"      # and these many frames into the world
 $env:VICTORY_DUMP_TARGETS = 1                       # every render layer of those frames
+$env:VICTORY_BVH_BUILDER = 1                        # ray tracing of characters and moving objects too
 target\diag\victory.exe run "<game folder>\<the game's .exe>" --execute > run.log 2>&1
 ```
 
