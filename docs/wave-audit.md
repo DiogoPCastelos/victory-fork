@@ -231,7 +231,20 @@ programs (47 before). These are the compute program the opening dropped in every
 (no exact form before: a lane mask exchanged where not every lane runs, and dual-bank refused
 its far jump), and 3 that were on an APPROXIMATE half-wave form (15 → 12). All four pass
 `dxil.dll` and build a pipeline on the RTX 3060. Compute programs that do not translate: 6 → 5.
-Not seen yet in a game run.
+In the game (RTX 3060, 2026-11-26, four runs to the world): the program translates at start
+("shader translated"), runs in the world's captured frames (1-3 dispatches a frame) and is
+dropped nowhere; no run logged a shader that does not translate. That it computes the right
+picture is not shown: two other programs write the same two targets, so its own output cannot
+be told apart in a capture.
+
+Pack census after the far-jump commits (`945fe1f`, `47eaf6e`; `translate --list --validate
+--pipelines`, 32-lane host, view limit 999,999): 26,151 programs lowered; DXIL for 14,224 of
+14,262 vertex and pixel programs, 2,729 of 2,734 compute and 8,762 of 8,765 mesh programs;
+**every emitted program makes a pipeline** on the RTX 3060; 216 fail `dxil.dll`'s validator
+(111 vertex/pixel, 105 mesh, 0 compute: mesh output over 32 KB, signatures not as the module
+expects, rows packing elements of different interpolation modes; the driver takes them).
+Compute paths: 51 dual-bank (exact), 27 of the allocation idiom (exact), 12 half-wave forms
+marked APPROXIMATE and 36 wave32 programs whose lane write is APPROXIMATE.
 
 ### More lane tests (both paths)
 

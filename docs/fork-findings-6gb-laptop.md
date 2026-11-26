@@ -112,7 +112,12 @@ buffer, read back the next frame, and those slots go first.
 
 Anything the sun does not reach directly looks like dusk: the title's bounce
 light and its lamp and sun shadows are ray traced, and the ray-tracing
-structure builder has never run in this fork (below). The depth bounds test
+structure builder is off (below). The static world's structures ship
+pre-built, and the trace programs that walk them do light it: a 2026-11-26
+capture with them held back (`VICTORY_BVH_HOLD=1`) shows the dorm almost
+black, and lit without the switch. What the builder would add (skinned
+characters, moving objects) is missing from the structures the rays walk;
+how much of the picture that changes has not been looked at. The depth bounds test
 (upstream, #82) lit the first room by its lamp on the fork's machine.
 
 ## Ray tracing
@@ -198,18 +203,62 @@ programs still translate. What this branch keeps is the console-lane order
 for `v_permlane16`/`x16` programs (upstream lowers the instructions but did
 not ask for the console's lane order there).
 
-Still failing, by cause (the pack census, 32-lane host):
+Still failing, by cause. Pack census of 2026-11-26 on `main` after the
+far-jump commits (`translate --list --validate --pipelines`, 32-lane host,
+view limit 999,999): 26,599 containers, 26,151 programs lowered, and every
+emitted program makes a pipeline on the RTX 3060. Of the 270 containers
+that do not translate, the opening binds none (four runs to the world logged
+no shader that does not translate):
 
 | Programs | Cause |
 |---|---|
-| 5 compute (alpha prefilter, particle visibility, reflection tiling, two triangle-clip programs) | still 64-lane waves on a 32-lane GPU: shared memory read and written inside a branch only some lanes take, where the split halves cannot meet |
-| 2 compute (water volumetrics) | translate and validate since the double-precision sums, but the driver refuses the pipeline |
-| 1 compute (cascade shadow tiles) | a lane mask exchanged where not every lane runs (32-lane GPUs only) |
-| 195 | an address in an SGPR that is no root parameter |
-| 71 mesh | the validator: vertex plus primitive output over 32 KB |
-| 72 | the validator: input or output signature not as the module expects |
-| 70, mostly mesh | the validator: elements of different interpolation modes packed into one row |
-| 40 | a descriptor chosen by control flow |
+| 195 geometry | an address in an SGPR that is no root parameter (no geometry-shader path) |
+| 40 (37 pixel, 3 mesh) | a sampler chosen by control flow, one of them constant |
+| 29 | no DXIL part (SM5 or older; a DLL the title does not load) |
+| 5 compute | a descriptor read only as data |
+| 1 pixel | an opaque lane mask |
+
+Translated but refused by `dxil.dll`'s validator (the driver takes them all):
+216 programs, 111 vertex/pixel and 105 mesh. 71 mesh programs output more
+than 32 KB; 72 have an input or output signature not as the module expects;
+about 70 pack elements of different interpolation modes into one row; 3
+pixel programs have an out-of-bounds coordinate that is not undef.
+
+(The table this replaces, from 2026-11-25, listed 5 compute programs still
+needing 64-lane waves, 2 the driver refused and the cascade-shadow program;
+none of those appear in this census.)
+
+The census also lists 1,373 programs (1,041 compute, 309 pixel, 20 mesh, 3
+vertex) whose per-lane branches are not the console's (`lane_exact.rs`):
+their translation is unchanged, the list says where to look. An attempt to
+route such compute programs to an exact form first changed 1,024 wave32
+programs (337 of them bound in the opening) and was followed by a black world
+in the game; it was dropped.
+
+## GPU time in the world (2026-11-26)
+
+On the RTX 3060, with `VICTORY_CARD_METER=1 VICTORY_CARD_METER_PIPELINES=1`,
+one 256-frame window in the world: 376 ms of the card's time a frame.
+
+- The most expensive programs run as native Wave32, not as an emulated
+  64-lane wave: the top one is a skinning program feeding the ray-tracing
+  builder, 51 ms a frame in 17 dispatches of 2.9 ms. The dual-bank program a
+  tester's breakdown pointed at costs 1-2 ms.
+- About 70 ms a frame are six skinning programs whose only reader in the
+  captured frames is the builder, which is off. About 40 ms are the programs
+  that walk the structures; those light the static world and must stay.
+- A/B, same switches, first 41 world windows each: nothing skipped, median
+  frame 818 ms; the six skinning programs skipped, 649 ms, the same lighting
+  in the captures; skinning and walking both skipped, 651 ms and the dorm
+  almost black. One pair of runs, game clock and shots differ; the draws a
+  frame were 5,655 against 6,318.
+
+The "memory wait" in a tester's logs (5060 Ti, three runs) is the
+submitting thread waiting for the card at the next point it must: the wait
+attributed to title memory read and the one to title memory changed under
+shader writes add up to about 300 ms a frame with and without the second copy
+queue, against 290-315 ms the frame spends waiting for the card. The copy
+queue moves the wait from one reason to the other.
 
 ## Intro video stutter
 
@@ -226,6 +275,18 @@ busy) and holds 24-30 fps once they are done. A start-up cost only.
   RAM free. A driver failing an allocation crashes this way; the pipeline
   workers now wait while the system's commit is nearly used up (below).
 - With the builder running, see "Ray tracing".
+- 2026-11-26: twice, in runs with `VICTORY_CARD_METER_PIPELINES=1`, an access
+  violation inside the NVIDIA driver (`nvwgf2umx.dll+0x422e03`, a read at
+  0x36) on entering the world, from `ResourceBarrier` in a list's state
+  prelude (`host.rs`, the barriers after the copies between depth textures
+  and their colour twins). Same address and stack both times; a run without
+  the meter reached the world. Not explained yet; a run with
+  `VICTORY_D3D12_DEBUG=1` should name the barrier.
+- 2026-11-26: one run lost the host device ("device removed") in the world
+  with the PC at 437 MB free of 16 GB (process 22 GB private); two others ended
+  on out-of-memory errors from the host (a list or a compare that could not
+  be recorded), one of them with the builder on. Memory, not a shader, on
+  this machine.
 - Later launches stopped at the title's start screen until a key was
   pressed (earlier ones had someone at the keyboard): unattended runs need
   `VICTORY_KEYS` (diagnostics builds), e.g. Enter every 15-30 s from 45 s.
@@ -339,15 +400,18 @@ Considered and not taken:
 | `VICTORY_COMPUTE_WAIT` | on | a dispatch waits for its pipeline |
 | `VICTORY_PIPELINE_COMMIT_MB` | 2048 | pipeline workers wait below this much free commit |
 | `VICTORY_SHADER_CACHE_FAILURES` | on | a translation that fails is kept in the shader cache under its key, so later runs and `--warm` do not translate it again |
+| `VICTORY_BVH_STAGES` | unset | diagnostics: only the first N ray-tracing builder programs run, in the order of their first dispatch (each logged), to find a bad stage by halving |
 
 ## Next
 
 1. GPU feedback for textures picked by index (which slots the frame samples).
 2. Find the ray-tracing builder stage that stores outside the structures'
-   buffers (above), then the trace programs end to end; the five shadow-mask
-   trace programs.
-3. The five 64-lane compute programs: a split form for shared memory inside
-   per-lane branches.
-4. Signature rows of mixed interpolation modes (70 programs) and mesh outputs over 32 KB (71).
-5. Compose the Series S UI plane over the 3D plane.
-6. GPU time per pass on this GPU: frames are 1-6 s, most of it uploads.
+   buffers (above): halve with `VICTORY_BVH_STAGES` and
+   `VICTORY_BVH_QUARANTINE=1`, watching the log's count of pages that are
+   not the title's memory. Then the dynamic structures end to end.
+3. While the builder is off, skip the six skinning programs that only feed
+   it, once something proves nothing else reads their buffer (about 20% of
+   the world frame in one A/B pair).
+4. The driver's access violation at the state prelude's barrier (above).
+5. Signature rows of mixed interpolation modes (about 70 programs) and mesh outputs over 32 KB (71).
+6. Compose the Series S UI plane over the 3D plane.

@@ -1,8 +1,17 @@
 # Ray tracing in this fork: what the title does and what has been built
 
-Status, 2026-11-25: **nothing is lit by ray tracing yet.** Most of the
-machinery translates and is unit-tested; it has not yet run end to end in the
-game. Everything here is off by default.
+Status, 2026-11-26: **the static world is lit by ray tracing; the dynamic
+structures are not built.** The trace programs run by default and walk the
+static world's structures, which ship pre-built in the title's data: a
+capture of the dorm with the walking programs held back
+(`VICTORY_BVH_HOLD=1`) is almost black, the same view with them running is
+lit (RTX 3060, runs of 2026-11-26). The builder, which builds and refits the
+dynamic structures (skinned characters, moving objects) every frame, is off
+by default (`VICTORY_BVH_BUILDER=1` turns it on); with it on, a stage stores
+outside the structures' buffers (see Known gaps).
+
+(Earlier status, 2026-11-25: "nothing is lit by ray tracing yet". That was
+written before a capture compared the two.)
 
 ## What the title does
 
@@ -69,7 +78,21 @@ shaders and emulates the one instruction.
   console wave), but a stage stores outside the structures' buffers: the
   title faults within seconds, and with `VICTORY_BVH_QUARANTINE=1` the layer
   runs out of memory copying what those stores name. See
-  [fork-findings-6gb-laptop.md](fork-findings-6gb-laptop.md).
+  [fork-findings-6gb-laptop.md](fork-findings-6gb-laptop.md). Seen again on
+  2026-11-26: the builder ran ("all of its programs have host pipelines
+  pipelines=53"), the card's memory in use went from 5.6 to 6.3 GB at its
+  first frame, and 8 s later a list could not be recorded (out of memory).
+  `VICTORY_BVH_STAGES=N` (diagnostics) runs only the first N builder
+  programs, in the order of their first dispatch, to find the stage by
+  halving; the log now counts pages shaders touch through raw addresses that
+  are not the title's memory at all.
+- While the builder is off, the six skinning programs that feed it still run
+  (about 70 ms of the card's time a frame on the RTX 3060); their output
+  buffer is named only by the builder's own dispatches in the captured frames.
+  Skipping them (`VICTORY_SKIP_PIPELINES`, diagnostics) gave a median world
+  frame of 649 ms against 818 ms with the same lighting, in one A/B pair of
+  runs. Not a default yet: shaders can read any view of the heap by index, so
+  "nothing else reads it" is not proven from bindings.
 - Five shadow-mask trace programs do not translate yet.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
