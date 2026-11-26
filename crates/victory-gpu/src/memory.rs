@@ -162,6 +162,10 @@ impl Memory {
                 // shortcut: a page of a title buffer inside this one that
                 // has a copy of its own is given this copy too.
                 let (first, len) = shadow.span();
+                // A copy in place begins in its buffer after the bytes before
+                // the title memory's first (its heap starts on a 64 KiB
+                // line): offsets in the directory are the buffer's.
+                let bias = shadow.offset(first);
                 let mut at = first.next_multiple_of(PAGE);
                 while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
                     // SAFETY: inside the directory's mapping.
@@ -169,7 +173,7 @@ impl Memory {
                     // SAFETY: as above; the offset first, as below.
                     unsafe {
                         if other.read() == 0 {
-                            other.add(1).write_volatile((at - first) as u32);
+                            other.add(1).write_volatile((at - first + bias) as u32);
                             other.write_volatile(n as u32 + 1);
                         }
                     }
@@ -185,7 +189,9 @@ impl Memory {
                 return;
             }
         };
-        let offset = shadow.offset_in(start).unwrap_or(0);
+        // In the buffer (`Shadow::offset`: past the bytes before the title
+        // memory in a copy in place).
+        let offset = shadow.offset_in(start).map_or(0, |_| shadow.offset(start));
         // The offset first: a shader that sees the number sees it too.
         // SAFETY: inside the directory's mapping.
         unsafe {
@@ -220,8 +226,26 @@ impl Memory {
                 );
             }
         }
+        // Pages that are not the title's memory at all: a shader computed
+        // an address nothing holds (a wild pointer, or a bad offset).
+        let mut wild = Vec::new();
         for page in pages {
             self.map(u64::from(page) * PAGE);
+            if self.refused.contains(&u64::from(page)) {
+                wild.push(u64::from(page) * PAGE);
+            }
+        }
+        if !wild.is_empty() {
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
+                let first: Vec<String> = wild.iter().take(6).map(|a| format!("{a:#x}")).collect();
+                tracing::warn!(
+                    pages = wild.len(),
+                    copies = self.copies.len(),
+                    first = %first.join(" "),
+                    "title memory by address: shaders touched pages that are not the title's memory (a wild address)"
+                );
+            }
         }
     }
 
@@ -286,8 +310,10 @@ pub(crate) fn ready(
         }
     };
     for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        let (first, len) = shadow.span();
+        // The whole buffer the directory's offsets count in, the bytes
+        // before the title memory of a copy in place included.
+        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len + shadow.offset(first));
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
     // Once per list, and for copies numbered since: the builder alone

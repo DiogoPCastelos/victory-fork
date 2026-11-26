@@ -2246,6 +2246,13 @@ impl State {
             }
             return;
         }
+        // Diagnostics: a builder stage past `VICTORY_BVH_STAGES` is held back.
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_builder(self.pipeline as This) && crate::pipeline::builder_stage_held(self.pipeline as This) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_why("a builder stage past VICTORY_BVH_STAGES".to_owned());
+            return;
+        }
         let made = crate::pipeline::host_pipeline(self.pipeline as This).or_else(|| {
             if !crate::pipeline::compute_waits() {
                 return None;

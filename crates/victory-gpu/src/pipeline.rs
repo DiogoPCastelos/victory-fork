@@ -356,6 +356,33 @@ pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
 }
 
+/// Diagnostics, to find a builder stage that stores where it should not:
+/// with `VICTORY_BVH_STAGES=N` only the first `N` builder programs, in the
+/// order of their first dispatch, run; the later ones are held back. Each
+/// program's place in that order is logged at its first dispatch, so runs
+/// with different `N` can be compared (bisected). Use with
+/// `VICTORY_BVH_QUARANTINE=1`: a held stage leaves the structures half
+/// built, which only the host's copies then see.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn builder_stage_held(this: This) -> bool {
+    static LIMIT: OnceLock<Option<usize>> = OnceLock::new();
+    static ORDER: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let limit = *LIMIT.get_or_init(|| std::env::var("VICTORY_BVH_STAGES").ok().and_then(|v| v.trim().parse().ok()));
+    let p = pipeline(this);
+    let name = p.shaders.iter().map(|s| s.hash.as_str()).collect::<Vec<_>>().join("+");
+    let mut order = ORDER.lock().unwrap_or_else(|e| e.into_inner());
+    let at = match order.iter().position(|n| *n == name) {
+        Some(at) => at,
+        None => {
+            order.push(name.clone());
+            let at = order.len() - 1;
+            tracing::info!(stage = at, shader = %name, held = limit.is_some_and(|l| at >= l), "builder stage first dispatched");
+            at
+        }
+    };
+    limit.is_some_and(|l| at >= l)
+}
+
 /// A stage of the builder was dropped after all: none runs from here on.
 #[cfg(windows)]
 pub(crate) fn builder_off(why: &'static str) {
