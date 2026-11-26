@@ -2,7 +2,7 @@
 
 For whoever continues: a person, or an assistant reading this cold. It says what the project
 is, what was done in the last session, what state it is in, how to run it, and what is open.
-Read `CLAUDE.md` (project rules) and `docs/wave-audit.md` (wave translation: inventory,
+Read `docs/CLAUDE.md` (project rules) and `docs/wave-audit.md` (wave translation: inventory,
 census, tests, benchmark) next.
 
 ## The project in one paragraph
@@ -24,7 +24,7 @@ The title's files live outside the repository and are **never written to**.
   (`docs/asset-policy.md`, `.victory-root`).
 - XCL (another such project) is GPL-2.0-only: ideas only, never code.
 - Commit with the GitHub noreply identity, never to `main`; push only to the user's fork.
-- `CLAUDE.md`: no silent approximations by default; report only what was actually run and
+- `docs/CLAUDE.md`: no silent approximations by default; report only what was actually run and
   measured; GPU tests count as "not run" without a suitable GPU.
 - The user's game files are sacred: read them, never modify them.
 
@@ -79,8 +79,27 @@ changed nothing: the title still renders at 2560×1440.
   On the 6 GB card it is past its budget from the world's first frame (6.6-6.9 GB used of
   5.2 GB) and the PC is down to ~0.5-2 GB of commit; ~18,000 slots wait. The older fork's
   best run had the same black albedo. **It is a memory problem, not a shader problem.**
-- Next step being arranged: a test on a machine with 32 GB RAM and a 16 GB+ NVIDIA GPU, to
-  confirm textures appear when memory allows (a test build was zipped for that).
+- **Next step: a tester with 32 GB RAM and a 16 GB+ NVIDIA GPU**, to confirm textures appear
+  when memory allows. The user is asking around for one, and a prebuilt test build was
+  zipped for it. Testers follow the README to build and run it, and `CONTRIBUTING.md` for
+  what to send back. Reports arrive as GitHub issues through the "Run report" form
+  (`.github/ISSUE_TEMPLATE/run-report.yml`): full specs, `run.log`, and screenshots of the
+  picture and its render layers (diagnostics build captures).
+- When a report comes in:
+  - read its `run.log` for the `fps,` lines, `textures picked by index, the queue`,
+    `video memory as the system counts it` and any `ERROR`;
+  - compare its base-colour (`f27`) and normals (`f28`) layers.
+
+  Textures in the base colour on the bigger card confirm the memory diagnosis.
+
+## The repository's front matter
+
+- `README.md`: what the fork is (from `fxceless/victory-fork` by hyphennn, from
+  Marvisak's VIctory), the dual-bank approach, how to build, warm and run, and credits.
+- `CONTRIBUTING.md`: what a run report must contain, and how to capture render layers.
+- `docs/CLAUDE.md`: the rules for the wave translation work.
+- `docs/wave-audit.md`: the wave translation in numbers.
+- This file.
 
 ## How to run (PowerShell, from the repo root)
 

@@ -91,7 +91,7 @@ Remove-Item Env:VICTORY_CAPTURE, Env:VICTORY_CAPTURE_WORLD, Env:VICTORY_CAPTURE_
 
 Pull requests are welcome. Please:
 
-- read [CLAUDE.md](CLAUDE.md) (the rules for the shader translation work) and
+- read [docs/CLAUDE.md](docs/CLAUDE.md) (the rules for the shader translation work) and
   [docs/HANDOVER.md](docs/HANDOVER.md) (where things stand) first;
 - run `cargo test -p victory-shader --lib` and `cargo test -p victory-gpu --lib`, and say
   which GPU the GPU tests ran on (they print "NOT RUN" without one);
