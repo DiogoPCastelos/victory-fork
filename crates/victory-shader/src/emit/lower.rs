@@ -294,6 +294,11 @@ struct Lower<'a> {
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
+    /// Whether this thread is within a `DispatchX` thread count where its
+    /// threads past the count must stay (a group barrier, two host waves
+    /// meeting through LDS, halves): their writes to memory and LDS are
+    /// left out ([`Self::dispatch_threads_prologue`], [`Self::write_guard`]).
+    partial_active: Option<V>,
     wave_base: Option<V>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
@@ -1751,6 +1756,7 @@ impl<'a> Lower<'a> {
             permute_area: permute,
             approx_lane_write: false,
             halves,
+            partial_active: None,
             wave_base: None,
             flat: None,
             no_barrier,
@@ -3109,7 +3115,7 @@ impl<'a> Lower<'a> {
         };
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
         let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
-        let guard = self.guard(b, i)?;
+        let guard = self.write_guard(b, i, { let n = inst.name(); n.contains("store") || n.contains("atomic") })?;
         let c = self.cur;
         let (i32t, res, void) = (self.s.t.i32, self.s.t.res_ret, self.s.t.void);
         let iu = self.s.m.undef(i32t);
@@ -4346,22 +4352,19 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Component `c` of the thread id in the group. With console lanes, the
-    /// thread is relabelled so that its host lane is its console lane: the
-    /// flat id is the wave's first lane's, rounded down to the wave size,
-    /// plus the lane index. (A bijection while each host wave holds a
-    /// wave-aligned run of flat ids, as the console's waves do.)
-    /// Threads past a `DispatchX` thread count leave
+    /// Threads past a `DispatchX` thread count
     /// ([`super::shader::USER_DISPATCH_THREADS`]): the console runs the
     /// groups that hold the counted threads, and in the last group of an
     /// axis the threads at or past the count are not in EXEC. Only for a
     /// compute program with a spilled user-data table (the structure
-    /// builder's) whose threads may leave at once: no group barrier, the
-    /// plain form (not dual-bank, not two host waves meeting through LDS,
-    /// not halves), and no loop back to the first block. There EXEC,
-    /// ballots and wave reductions then see the console's lanes. Other
-    /// forms are left as they are (the host says so when such a dispatch
-    /// cuts a group). After the fxceless fork's pull request #646.
+    /// builder's), and never a dual-bank one. Where they may leave at once
+    /// (no group barrier, the plain form, no loop back to the first block)
+    /// they leave, and EXEC, ballots and wave reductions see the console's
+    /// lanes. Where they must stay (a barrier, two host waves meeting
+    /// through LDS, halves) they keep the group in step and only their
+    /// writes to memory and LDS are left out ([`Self::write_guard`]); they
+    /// still count in ballots and wave reductions there. After the fxceless
+    /// fork's pull request #646.
     fn dispatch_threads_prologue(&mut self, order: &[usize]) {
         use super::shader::USER_DISPATCH_THREADS;
         if self.x.native.stage != HwStage::Cs || self.user_first() == 0 {
@@ -4371,11 +4374,12 @@ impl<'a> Lower<'a> {
             return;
         };
         let barrier = self.x.p.blocks.iter().any(|blk| blk.insts.iter().any(|i| i.name() == "s_barrier"));
-        let plain = !DUAL_BANK.get() && self.exchange.is_none() && self.halves.is_none() && !self.split_lds;
-        let first = order[0];
-        if !plain || barrier || !self.x.p.blocks[first].preds.is_empty() || self.counters.contains_key(&first) {
+        if DUAL_BANK.get() {
             return;
         }
+        let plain = self.exchange.is_none() && self.halves.is_none() && !self.split_lds;
+        let first = order[0];
+        let leave = plain && !barrier && self.x.p.blocks[first].preds.is_empty() && !self.counters.contains_key(&first);
         let e = self.s.entry;
         let zero = self.s.m.i32(0);
         let mut active: Option<V> = None;
@@ -4404,6 +4408,12 @@ impl<'a> Lower<'a> {
         let Some(active) = active else {
             return;
         };
+        if !leave {
+            // The threads past the count stay (barriers, the halves' exchange):
+            // their writes are left out (`write_guard`).
+            self.partial_active = Some(active);
+            return;
+        }
         let body = self.s.m.new_block();
         let exit = self.s.m.new_block();
         self.s.m.terminate(e, Term::CondBr(active, body, exit));
@@ -4412,6 +4422,22 @@ impl<'a> Lower<'a> {
         self.cur = body;
     }
 
+    /// The guard of instruction `(b, i)`, and, when `writes` (it stores to
+    /// memory or LDS, or is an atomic), within a `DispatchX` thread count
+    /// where the threads past it stay ([`Self::partial_active`]).
+    fn write_guard(&mut self, b: usize, i: usize, writes: bool) -> Result<Option<V>, Why> {
+        let g = self.guard(b, i)?;
+        Ok(match (g, self.partial_active.filter(|_| writes)) {
+            (Some(g), Some(a)) => Some(self.s.m.bin(self.cur, Bin::And, g, a)),
+            (g, a) => g.or(a),
+        })
+    }
+
+    /// Component `c` of the thread id in the group. With console lanes, the
+    /// thread is relabelled so that its host lane is its console lane: the
+    /// flat id is the wave's first lane's, rounded down to the wave size,
+    /// plus the lane index. (A bijection while each host wave holds a
+    /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
         if !self.console_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
@@ -4698,7 +4724,8 @@ impl<'a> Lower<'a> {
             return Err("GDS");
         }
         let name = inst.name();
-        let guard = self.guard(b, i)?;
+        let writes = !["ds_read", "ds_load", "ds_swizzle", "ds_permute", "ds_bpermute"].iter().any(|p| name.starts_with(p));
+        let guard = self.write_guard(b, i, writes)?;
         let c = self.cur;
         let offset = u32::from(*offset0) | u32::from(*offset1) << 8;
         let dst_reg = match dst {
@@ -9949,7 +9976,7 @@ impl<'a> Lower<'a> {
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
-        let guard = self.guard(b, i)?;
+        let guard = self.write_guard(b, i, { let n = inst.name(); n.starts_with("image_store") || n.starts_with("image_atomic") })?;
         let c = self.cur;
         let (kind, coords) = match dim {
             0 => (1, 1),
@@ -10742,7 +10769,7 @@ impl<'a> Lower<'a> {
             return Err(name);
         }
         let site = (b, i);
-        let guard = self.guard(b, i)?;
+        let guard = self.write_guard(b, i, name.contains("_store") || name.starts_with("buffer_atomic_"))?;
         let c = self.cur;
         let store = name.starts_with("buffer_store_");
         // DXIL atomic operations: add, and, or, xor, signed and unsigned
