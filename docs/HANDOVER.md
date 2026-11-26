@@ -11,7 +11,7 @@ VIctory is a compatibility layer (Rust, Windows, D3D12) that runs an Xbox Series
 PC. It loads the title's executable, implements the console's OS and graphics APIs, and
 translates the console GPU's shader machine code (GFX10 / RDNA 2) into DXIL for D3D12. This
 checkout is a fork of `fxceless/victory-fork` (itself a fork of `Marvisak/VIctory`), kept
-on the user's own fork `DiogoPCastelos/victory-fork`, branch `fork/from-victory-fork`. It
+on the user's own fork `DiogoPCastelos/victory-fork`, branch `main`. It
 is not meant as a pull request to the original.
 
 The test machine: RTX 3060 Laptop (6 GB, 32-lane waves only), 16 GB RAM, i7-11800H.
