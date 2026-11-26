@@ -204,19 +204,55 @@ for `v_permlane16`/`x16` programs (upstream lowers the instructions but did
 not ask for the console's lane order there).
 
 Still failing, by cause. Pack census of 2026-11-26 on `main` after the
-far-jump commits (`translate --list --validate --pipelines`, 32-lane host,
-view limit 999,999): 26,599 containers, 26,151 programs lowered, and every
-emitted program makes a pipeline on the RTX 3060. Of the 270 containers
-that do not translate, the opening binds none (four runs to the world logged
-no shader that does not translate):
+upstream ports (below; `translate --list --validate --pipelines`, 32-lane
+host, view limit 999,999): 26,599 containers, 26,151 programs lowered, and
+every emitted program makes a pipeline on the RTX 3060: 25,755 pipelines
+(25,715 before the ports). Of the 230 containers that do not translate, the
+opening binds none (four runs to the world logged no shader that does not
+translate):
 
 | Programs | Cause |
 |---|---|
 | 195 geometry | an address in an SGPR that is no root parameter (no geometry-shader path) |
-| 40 (37 pixel, 3 mesh) | a sampler chosen by control flow, one of them constant |
 | 29 | no DXIL part (SM5 or older; a DLL the title does not load) |
 | 5 compute | a descriptor read only as data |
 | 1 pixel | an opaque lane mask |
+
+The 40 programs (37 pixel, 3 mesh) that chose between two immediate
+samplers by a branch ("a sampler chosen by control flow, one of them
+constant") now translate, validate and make pipelines: both samplers are
+bound, the program samples with each and keeps the texel of the edge the
+console's sampler came by (after the fxceless fork's pull request #1314).
+
+### Upstream ports (2026-11-26)
+
+Copied from the fxceless fork and from upstream VIctory (Marvisak), tested
+here, not merged; nothing in the dual-bank lowering or the 64-lane forms
+changed (every compute path count in the census is unchanged).
+
+- **The ray-tracing builder's thread counts.** A `DispatchX` with flags bit
+  5 (`USE_THREAD_DIMENSIONS`) counts threads, not groups; the builder's box
+  stages dispatch that way, and taken as groups they ran up to 64 times the
+  threads asked (found by the fxceless fork, pull request #646). The host now
+  dispatches the groups that hold the threads and passes the counts
+  (`USER_DISPATCH_THREADS`); 37 plain Wave32 builder programs leave the
+  threads past the count at entry. Their emitted code is the only builder
+  code that changed: the two-wave and halves forms are byte for byte the
+  same, and those keep the extra threads of the last group (the host logs
+  it once per pipeline). Not yet run in the game.
+- **Shaders:** cube-map levels with explicit gradients were 1.44 times too
+  coarse (DXIL's `Log` is already base 2); a mesh program's triangle corner
+  index is 9 bits (the edge flag above it named a vertex past the written
+  ones and culled the triangle); a program's constant table starts after its
+  instructions (it was the whole program; VIctory #2143).
+- **Host:** a released view heap takes its run of raw-address views with it
+  (a heap made later at the same address found the old run); a constant view
+  of no bytes stays one; a view moved to its first mapped level keeps the
+  title's minimum level; BC7 rotation only in modes 4 and 5; the driver
+  watch no longer counts the Auto HDR notice as an error.
+- About 70 small VIctory fixes that applied as they are (audio, saves,
+  async calls, loader, samplers, formats, tools). One VIctory test for HDR
+  captures was left out: our captures do not have the code it tests.
 
 Translated but refused by `dxil.dll`'s validator (the driver takes them all):
 216 programs, 111 vertex/pixel and 105 mesh. 71 mesh programs output more
@@ -405,10 +441,12 @@ Considered and not taken:
 ## Next
 
 1. GPU feedback for textures picked by index (which slots the frame samples).
-2. Find the ray-tracing builder stage that stores outside the structures'
-   buffers (above): halve with `VICTORY_BVH_STAGES` and
-   `VICTORY_BVH_QUARANTINE=1`, watching the log's count of pages that are
-   not the title's memory. Then the dynamic structures end to end.
+2. Run the ray-tracing builder (`VICTORY_BVH_BUILDER=1`, first with
+   `VICTORY_BVH_QUARANTINE=1`) with the thread-count fix (above), which is
+   the likely cause of its stores outside the structures' buffers. If it
+   still stores outside them, halve with `VICTORY_BVH_STAGES`, watching the
+   log's count of pages that are not the title's memory. Then the dynamic
+   structures end to end.
 3. While the builder is off, skip the six skinning programs that only feed
    it, once something proves nothing else reads their buffer (about 20% of
    the world frame in one A/B pair).

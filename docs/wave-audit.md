@@ -237,9 +237,10 @@ dropped nowhere; no run logged a shader that does not translate. That it compute
 picture is not shown: two other programs write the same two targets, so its own output cannot
 be told apart in a capture.
 
-Pack census after the far-jump commits (`945fe1f`, `47eaf6e`; `translate --list --validate
---pipelines`, 32-lane host, view limit 999,999): 26,151 programs lowered; DXIL for 14,224 of
-14,262 vertex and pixel programs, 2,729 of 2,734 compute and 8,762 of 8,765 mesh programs;
+Pack census after the upstream ports of 2026-11-26 (`translate --list --validate
+--pipelines`, 32-lane host, view limit 999,999): 26,151 programs lowered; DXIL for 14,261 of
+14,262 vertex and pixel programs, 2,729 of 2,734 compute and 8,765 of 8,765 mesh programs
+(14,224 and 8,762 before: the 40 programs choosing between two immediate samplers by a branch);
 **every emitted program makes a pipeline** on the RTX 3060; 216 fail `dxil.dll`'s validator
 (111 vertex/pixel, 105 mesh, 0 compute: mesh output over 32 KB, signatures not as the module
 expects, rows packing elements of different interpolation modes; the driver takes them).

@@ -343,3 +343,17 @@ pub(crate) fn ready(
         base,
     })
 }
+
+/// Forgets the run of title-memory views kept for host view heap `heap`
+/// (`Memory::heaps`, by address), when the title releases its heap. A heap
+/// made later at the same address found the old run: its null view and the
+/// copies' views were never written there, and the run's first slot could
+/// lie among the new heap's title slots or past its end, so shaders reading
+/// through raw addresses indexed views that were not theirs. (After the
+/// fxceless fork's pull request #589, by AscilCH.)
+pub(crate) fn forget_heap(heap: &HostHeap) {
+    let key = std::ptr::from_ref(heap) as usize;
+    if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.heaps.remove(&key);
+    }
+}

@@ -82,6 +82,12 @@ shaders and emulates the one instruction.
   2026-11-26: the builder ran ("all of its programs have host pipelines
   pipelines=53"), the card's memory in use went from 5.6 to 6.3 GB at its
   first frame, and 8 s later a list could not be recorded (out of memory).
+  Likely cause, fixed since and not yet run in the game: the builder's box
+  stages dispatch with `DispatchX` flags bit 5, which counts threads, not
+  groups; taken as groups they ran up to 64 times the threads asked (found
+  by the fxceless fork, pull request #646). The host now dispatches the
+  groups that hold the threads, and 37 plain Wave32 builder programs leave
+  the threads past the count (see the findings doc, "Upstream ports").
   `VICTORY_BVH_STAGES=N` (diagnostics) runs only the first N builder
   programs, in the order of their first dispatch, to find the stage by
   halving; the log now counts pages shaders touch through raw addresses that
