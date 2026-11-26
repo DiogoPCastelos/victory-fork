@@ -4723,7 +4723,7 @@ impl<'a> Lower<'a> {
                 self.group_sync(c);
                 // a lane past the end of the group is not there on the console: 0
                 let group = self.s.threads.map_or(64, |t| t.iter().product::<u32>());
-                let r = if group % 64 != 0 {
+                let r = if !group.is_multiple_of(64) {
                     let n = self.s.m.i32(group);
                     let there = self.s.m.cmp(c, pred::IULT, theirs_thread, n);
                     let z = self.s.m.i32(0);

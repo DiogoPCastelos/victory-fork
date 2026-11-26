@@ -311,7 +311,7 @@ impl Card {
                 ud[u.index as usize] = s[d as usize];
             }
         }
-        let mut once = || {
+        let once = || {
             self.host
                 .dispatch(
                     &self.root,
