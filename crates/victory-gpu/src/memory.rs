@@ -365,6 +365,7 @@ impl Memory {
         // Pages that are not the title's memory at all: a shader computed
         // an address nothing holds (a wild pointer, or a bad offset).
         let mut wild = Vec::new();
+        let faulted: Vec<u64> = pages.iter().map(|&p| u64::from(p)).collect();
         for page in pages {
             let at = u64::from(page) * PAGE;
             self.map(at, true);
@@ -397,6 +398,7 @@ impl Memory {
                 );
             }
         }
+        classify_faults(&faulted, &self.refused);
     }
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
@@ -443,6 +445,16 @@ pub(crate) fn ready(
         m.take_faults();
         m.let_go_idle();
         m.say();
+    } else {
+        // The faults are read every 250 ms as well: as the world appears a
+        // frame takes seconds, and the pages a dispatch found empty are then
+        // copied (and counted) before the next frame begins.
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = crate::host::now_ms();
+        if now >= LAST.load(std::sync::atomic::Ordering::Relaxed) + 250 {
+            LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+            m.take_faults();
+        }
     }
     let mut named = Vec::new();
     for &address in addresses {
@@ -535,5 +547,123 @@ pub(crate) fn forget_heap(heap: &HostHeap) {
     let key = std::ptr::from_ref(heap) as usize;
     if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         m.heaps.remove(&key);
+    }
+}
+
+// The ranges the title's own builder calls name (`victory_hle`'s
+// `VICTORY_BVH_TRACE`): each build's destination and scratch, so a page a
+// shader touched without a copy can be told apart: inside a range the title
+// asked the builder to use (a legal address the layer did not make ready),
+// inside the title's memory but outside every such range (a store or read
+// past a structure's end), or not the title's memory at all.
+
+/// A range a builder call names: start, bytes, the call's number since the
+/// start, and what it is.
+#[derive(Clone, Copy)]
+struct BuildRange {
+    start: u64,
+    len: u64,
+    call: u64,
+    what: &'static str,
+}
+
+/// The ranges noted, at most the last [`RANGES_KEPT`].
+static RANGES: Mutex<std::collections::VecDeque<BuildRange>> = Mutex::new(std::collections::VecDeque::new());
+const RANGES_KEPT: usize = 16_384;
+
+/// Notes a range the title's builder calls name (`what`: "destination",
+/// "scratch", "update destination", "rehydrated"), for the faults' census.
+pub fn note_build_range(start: u64, len: u64, call: u64, what: &'static str) {
+    if len == 0 {
+        return;
+    }
+    let mut ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    if ranges.len() >= RANGES_KEPT {
+        ranges.pop_front();
+    }
+    ranges.push_back(BuildRange { start, len, call, what });
+}
+
+/// What `page` (a 64 KiB page's first byte) lies in: the latest noted range
+/// that overlaps it, else the nearest one below it and the distance.
+fn build_range_of(page: u64) -> (Option<BuildRange>, Option<(BuildRange, u64)>) {
+    let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    let end = page + PAGE;
+    let inside = ranges.iter().rev().find(|r| r.start < end && page < r.start + r.len).copied();
+    let below = ranges
+        .iter()
+        .filter(|r| r.start + r.len <= page)
+        .min_by_key(|r| page - (r.start + r.len))
+        .map(|r| (*r, page - (r.start + r.len)));
+    (inside, below)
+}
+
+/// The faulted pages by what they are (with builder ranges noted): a line
+/// each kind, with the first examples and the build they belong to or lie
+/// past.
+fn classify_faults(pages: &[u64], refused: &std::collections::HashSet<u64>) {
+    if RANGES.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        return;
+    }
+    let (mut legal, mut past, mut wild) = (Vec::new(), Vec::new(), Vec::new());
+    for &page in pages {
+        let at = page * PAGE;
+        if refused.contains(&page) {
+            wild.push(at);
+            continue;
+        }
+        match build_range_of(at) {
+            (Some(r), _) => legal.push((at, r)),
+            (None, below) => past.push((at, below)),
+        }
+    }
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 40 {
+        return;
+    }
+    let first_legal: Vec<String> = legal
+        .iter()
+        .take(4)
+        .map(|(at, r)| format!("{at:#x} in call {}'s {} {:#x}+{:#x}", r.call, r.what, r.start, r.len))
+        .collect();
+    let first_past: Vec<String> = past
+        .iter()
+        .take(4)
+        .map(|(at, below)| match below {
+            Some((r, by)) => format!("{at:#x}, {by:#x} past call {}'s {} {:#x}+{:#x}", r.call, r.what, r.start, r.len),
+            None => format!("{at:#x}, below every noted range"),
+        })
+        .collect();
+    tracing::warn!(
+        legal = legal.len(),
+        past = past.len(),
+        wild = wild.len(),
+        "title memory by address, the faulted pages against the builder calls' ranges: inside a build's destination or scratch (a legal address not made ready) [{}]; the title's memory outside every such range [{}]; not the title's memory {}",
+        first_legal.join("; "),
+        first_past.join("; "),
+        wild.iter().take(4).map(|a| format!("{a:#x}")).collect::<Vec<_>>().join(" ")
+    );
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    /// A faulted page is inside a noted range, or past the nearest one below
+    /// it by its distance.
+    #[test]
+    fn faulted_pages_are_told_by_the_builder_ranges() {
+        let base = 0x7_7000_0000u64;
+        note_build_range(base, 0x2_b800, 1, "destination");
+        note_build_range(base + 0x10_0000, 0x1_3674, 1, "scratch");
+        let (inside, _) = build_range_of(base + 0x2_0000 & !(PAGE - 1));
+        assert_eq!(inside.map(|r| r.what), Some("destination"));
+        let page = base + 0x4_0000;
+        let (inside, below) = build_range_of(page);
+        assert!(inside.is_none(), "past the destination's end");
+        let (r, by) = below.expect("the destination below it");
+        assert_eq!((r.what, by), ("destination", page - (base + 0x2_b800)));
+        let (inside, _) = build_range_of(base + 0x10_0000);
+        assert_eq!(inside.map(|r| r.what), Some("scratch"));
     }
 }

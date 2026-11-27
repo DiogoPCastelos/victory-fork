@@ -156,7 +156,24 @@ struct Through {
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     )>,
+    /// What the layouts were made for: the source's and the placed view's
+    /// textures ([`shape`]). The source behind a view can change (another
+    /// texture the host writes at that memory, or one made again): layouts
+    /// made for another shape name subresources and rows the copy's texture
+    /// does not have.
+    made_for: (Shape, Shape),
 }
+
+/// A texture's description, as far as its copy layouts depend on it.
+type Shape = (u64, u32, u16, u16, i32, i32);
+
+fn shape(d: &D3D12_RESOURCE_DESC) -> Shape {
+    (d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Format.0, d.Dimension.0)
+}
+
+/// Copies through [`alias`] whose cached layouts were made for another
+/// source or view shape (made again; before, they were used as they were).
+static ALIAS_STALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The most levels times layers [`alias`] copies (a cube of nine levels).
 const ALIAS_PARTS: u32 = 54;
@@ -190,14 +207,29 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         return false;
     };
     let Some(host) = host() else { return false };
+    // SAFETY: live textures.
+    let (of_from, of_to) = unsafe { (from.GetDesc(), to.GetDesc()) };
+    let now_for = (shape(&of_from), shape(&of_to));
     let through = {
         let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
         let map = map.get_or_insert_with(HashMap::new);
+        // Layouts made for another source or view shape are made again.
+        if let Some(stale) = map.get(&(placed as usize)).filter(|t| t.made_for != now_for) {
+            let n = ALIAS_STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 16 {
+                tracing::warn!(
+                    view = ?placed,
+                    texture = ?source,
+                    made_for = ?stale.made_for,
+                    now = ?now_for,
+                    "an alias copy's cached layouts were made for another source or view shape: made again (before, a copy used them as they were)"
+                );
+            }
+            map.remove(&(placed as usize));
+        }
         match map.get(&(placed as usize)) {
             Some(through) => through.clone(),
             None => {
-                // SAFETY: live textures.
-                let (of_from, of_to) = unsafe { (from.GetDesc(), to.GetDesc()) };
                 // Levels times layers (a volume's slices are one part).
                 let count = |d: &D3D12_RESOURCE_DESC| {
                     let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
@@ -270,6 +302,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 let through = Arc::new(Through {
                     buffer,
                     parts: of_written.into_iter().zip(of_read).collect(),
+                    made_for: now_for,
                 });
                 map.insert(placed as usize, through.clone());
                 through

@@ -260,10 +260,10 @@ World runs with `VICTORY_BVH_BUILDER=1`, after the thread-count fixes (the
 box stages' threads past a `DispatchX` count now write nothing, also in the
 paired and halves forms):
 
-- No more crashes in the title's own code on box-node data (before the
-  fixes: 16-bit infinities read as pointers, 1 to 20 s after the builder
-  started).
-- Every run ended out of memory 5 to 18 s after the builder started (a host
+- Earlier runs faulted in title code on pointers resembling box-node data
+  1 to 20 s after the builder started. The post-fix runs below ended with
+  different errors. Whether the generated structures are valid remains open.
+- Several runs ended out of memory 5 to 18 s after the builder started (a host
   list that did not close, a card copy that could not be recorded), with
   0.5 to 2 GB of commit left. The world alone climbs to 21.6-21.8 GB private
   here (0.4-0.5 GB of commit left, builder off, the same in a run of the
@@ -274,11 +274,11 @@ paired and halves forms):
   sections of 32 MiB and places a window that is one run of a section in that
   section's heap (opened once, at most 1 GB of sections,
   `VICTORY_INPLACE_SECTIONS_MB`). In the world it placed nothing: the
-  windows span pages of more than one section. Private memory in place
-  (`VICTORY_INPLACE_PRIVATE=1`, now off by default) ended two builder runs in
-  the card's driver (`nvwgf2umx.dll`, an access violation) within seconds;
-  without it, no such end. A buffer in a section heap takes every state the
-  layer uses (a card test).
+  windows span pages of more than one section. Two builder runs with private
+  in-place memory enabled ended in the NVIDIA driver. The same driver
+  fault occurred on 2026-11-27 with in-place memory off (see Stability).
+  Private in-place memory remains opt-in. A buffer in a section heap took
+  every resource state exercised by the card test.
 - 1 MiB windows (`VICTORY_WINDOW_KB=1024 VICTORY_WINDOW_TAILS=1`): the
   windows' unasked bytes fell from 1.5 GB to 3 MB; the builder lasted 13 s
   against 6 s; still out of memory.
@@ -348,6 +348,25 @@ busy) and holds 24-30 fps once they are done. A start-up cost only.
   RAM free. A driver failing an allocation crashes this way; the pipeline
   workers now wait while the system's commit is nearly used up (below).
 - With the builder running, see "Ray tracing".
+- 2026-11-27, RTX 3060 Laptop, builder and trace on, in-place memory off:
+  the driver faulted at `nvwgf2umx.dll+0x34a44a` reading address `0xc`.
+  The matching diagnostics symbols resolve the host stack to
+  `dispatch_x → bind → readable → texture::alias → CopyTextureRegion`.
+  The fault surfaced while recording the source texture subresource copy
+  into the intermediate buffer. The log does not identify the specific
+  resource or subresource. The underlying cause remains open.
+  Since: `texture::alias` keeps its copy layouts by the placed view alone,
+  and a view's source can change; each cached entry now remembers the
+  source's and the view's shapes, and one made for another shape is made
+  again (logged). One run since with the same switches: no such mismatch
+  logged, no driver fault, out of memory 7 s after the builder started (the
+  fault is intermittent: 3 of about 10 builder runs, so one run shows
+  nothing either way).
+- The faulted pages of title memory by address are now classified against
+  the ranges the title's builder calls name (`VICTORY_BVH_TRACE=1`) and read
+  every 250 ms: three runs, 7 s each from the builder's start, found none.
+  That bounds only the copies' pages: a store past one structure into
+  another on a page that has a copy is not counted.
 - 2026-11-26: twice, in runs with `VICTORY_CARD_METER_PIPELINES=1`, an access
   violation inside the NVIDIA driver (`nvwgf2umx.dll+0x422e03`, a read at
   0x36) on entering the world, from `ResourceBarrier` in a list's state

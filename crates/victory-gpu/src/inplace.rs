@@ -182,12 +182,9 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
 }
 
 /// Whether private title memory (its heaps) is placed in place too
-/// (`VICTORY_INPLACE_PRIVATE=1`; off by default: only sections of its
-/// physical pages are). Two world runs with the builder on and private
-/// memory in place ended in the card's driver (an access violation in
-/// `nvwgf2umx.dll`, RTX 3060, driver 621.24) a few seconds in; with it off,
-/// no such end. The runtime does not yet let such a heap go before the
-/// title frees, decommits or protects its pages.
+/// (`VICTORY_INPLACE_PRIVATE=1`, opt-in). An open private heap prevents the
+/// title from freeing, decommitting or protecting its pages. The runtime
+/// still needs a hook to release the heap before those operations.
 fn private_in_place() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_PRIVATE").is_some_and(|v| v == "1"))

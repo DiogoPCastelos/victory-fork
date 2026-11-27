@@ -7,8 +7,9 @@ capture of the dorm with the walking programs held back
 (`VICTORY_BVH_HOLD=1`) is almost black, the same view with them running is
 lit (RTX 3060, runs of 2026-11-26). The builder, which builds and refits the
 dynamic structures (skinned characters, moving objects) every frame, is off
-by default (`VICTORY_BVH_BUILDER=1` turns it on); with it on, a stage stores
-outside the structures' buffers (see Known gaps).
+by default (`VICTORY_BVH_BUILDER=1` turns it on). Builder-enabled runs on
+the RTX 3060 Laptop have ended in allocation failures and driver faults
+before dynamic ray hits were verified (see Known gaps).
 
 (Earlier status, 2026-11-25: "nothing is lit by ray tracing yet". That was
 written before a capture compared the two.)
@@ -75,17 +76,13 @@ shaders and emulates the one instruction.
 - With `VICTORY_BVH_BUILDER=1` the builder now runs on a 32-lane GPU (all 52
   of its programs translate there: the last three, block-wide scans, read a
   first lane of a value `lane_uniform` proves the same in both halves of a
-  console wave), but a stage stores outside the structures' buffers: the
-  title faults within seconds, and with `VICTORY_BVH_QUARANTINE=1` the layer
-  runs out of memory copying what those stores name. See
-  [fork-findings-6gb-laptop.md](fork-findings-6gb-laptop.md). Seen again on
-  2026-11-26: the builder ran ("all of its programs have host pipelines
-  pipelines=53"), the card's memory in use went from 5.6 to 6.3 GB at its
-  first frame, and 8 s later a list could not be recorded (out of memory).
-  Likely cause, fixed since and not yet run in the game: the builder's box
-  stages dispatch with `DispatchX` flags bit 5, which counts threads, not
-  groups; taken as groups they ran up to 64 times the threads asked (found
-  by the fxceless fork, pull request #646). The host now dispatches the
+  console wave). An earlier partially translated builder corrupted title
+  memory. On 2026-11-26 one run reported 53 host pipelines ready. Card
+  memory use went from 5.6 to 6.3 GB at the first builder frame. Recording
+  a command list failed 8 s later with an out-of-memory error.
+  The builder's box stages dispatch with `DispatchX` flags bit 5, which
+  counts threads. Treating that count as groups launched up to 64 times
+  the requested threads (fxceless fork, pull request #646). The host now dispatches the
   groups that hold the threads, and 37 plain Wave32 builder programs leave
   the threads past the count (see the findings doc, "Upstream ports").
   `VICTORY_BVH_STAGES=N` (diagnostics) runs only the first N builder
@@ -128,8 +125,19 @@ laptop):
   Every scratch range seen lies in one 64 MiB buffer.
 - **Prebuild info** (4,352 calls): bottom levels of 1 KiB to 10 MiB with up
   to 4 MiB of scratch; top levels of up to 32,768 instances (12 MiB of result,
-  3.7 MiB of scratch). These are the bounds a builder stage must keep to.
+  3.7 MiB of scratch). These sizes describe the queried inputs. Identifying
+  a particular build's allocation also requires matching those inputs to
+  the build and locating the destination and scratch allocations.
 - **Copy**: none.
+
+On 2026-11-27 an experimental build polled the raw-address fault buffer
+during dispatch preparation. With the builder on, all 27 logged polls in
+about seven seconds returned zero missing-page entries. The shader records
+an entry only when its page lacks a host copy. An access past a structure's
+end can still hit a mapped page. These polls carry no completion fence,
+byte offset, access width or dispatch identity. The run ended in a texture
+copy while binding a compute shader. See the
+[laptop stability findings](fork-findings-6gb-laptop.md#stability).
 
 ## Where to look
 

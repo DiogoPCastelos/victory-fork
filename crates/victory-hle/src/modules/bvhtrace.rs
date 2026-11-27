@@ -149,8 +149,45 @@ type RehydrateFn = unsafe extern "system" fn(usize, usize, u32, *const BuildDesc
 type PrebuildFn = unsafe extern "system" fn(usize, *const Inputs, *const u64, *mut PrebuildInfo);
 type CopyFn = unsafe extern "system" fn(usize, usize, u64, u64, u32);
 
+/// Prebuild answers by the address of the geometry descriptions they were
+/// asked for: result bytes at most, scratch bytes, update scratch bytes.
+/// (A title reuses such addresses: a match is likely, not certain.)
+static PREBUILDS: std::sync::Mutex<Option<std::collections::HashMap<u64, (u64, u64, u64)>>> = std::sync::Mutex::new(None);
+
+/// The longest range a build names, past which a length read from a gap is
+/// not believed (the scratch buffer seen is 64 MiB).
+const LONGEST: u64 = 64 << 20;
+
+/// Notes each descriptor's destination and scratch with the GPU side
+/// (`victory_gpu::note_build_range`), for its census of faulted pages. A
+/// destination's length: the gap to the next destination in the batch (they
+/// are packed: the gaps matched the prebuild answers), else the prebuild
+/// answer for its descriptions; a scratch's likewise.
+fn note_ranges(call: u64, count: u32, descs: *const u64) {
+    let read = |k: usize, i: usize| -> u64 {
+        // SAFETY: the title passes `count` descriptors of 10 words.
+        unsafe { descs.add(k * 10 + i).read_unaligned() }
+    };
+    let prebuilds = PREBUILDS.lock().unwrap_or_else(|e| e.into_inner());
+    for k in 0..count as usize {
+        let (dest, flags, geometry, scratch) = (read(k, 0), read(k, 1) >> 32, read(k, 3), read(k, 5));
+        let known = prebuilds.as_ref().and_then(|p| p.get(&geometry)).copied();
+        let gap = |i: usize, at: u64| {
+            (k + 1 < count as usize).then(|| read(k + 1, i)).filter(|&next| next > at && next - at <= LONGEST).map(|next| next - at)
+        };
+        let update = flags & 0x20 != 0;
+        let dest_len = gap(0, dest).or(known.map(|p| p.0)).unwrap_or(0);
+        let scratch_len = gap(5, scratch).or(known.map(|p| if update { p.2 } else { p.1 })).unwrap_or(0);
+        victory_gpu::note_build_range(dest, dest_len, call, if update { "update destination" } else { "destination" });
+        victory_gpu::note_build_range(scratch, scratch_len, call, "scratch");
+    }
+}
+
 /// `XboxBvhBuilder::BuildRaytracingAccelerationStructureBatched2X(list, count, descs)`.
 unsafe extern "system" fn build(this: usize, list: usize, count: u32, descs: *const u64) {
+    if !descs.is_null() {
+        note_ranges(CALLS[0].load(Ordering::Relaxed), count, descs);
+    }
     if full(0) && !descs.is_null() {
         // The batched descriptor is not public; read from a run's words, it
         // repeats every 10 words (80 bytes): destination; type (low dword:
@@ -217,6 +254,16 @@ unsafe extern "system" fn prebuild(this: usize, inputs: *const Inputs, stream: *
     let Some(f) = original_of(2, PREBUILD) else { return };
     // SAFETY: the title DLL's own export, with the title's arguments.
     unsafe { std::mem::transmute::<usize, PrebuildFn>(f)(this, inputs, stream, info) };
+    if !inputs.is_null() && !info.is_null() {
+        // SAFETY: the title's own structures, filled by the call.
+        let (i, out) = unsafe { (&*inputs, &*info) };
+        let mut prebuilds = PREBUILDS.lock().unwrap_or_else(|e| e.into_inner());
+        let map = prebuilds.get_or_insert_with(Default::default);
+        if map.len() > 65_536 {
+            map.clear();
+        }
+        map.insert(i.data, (out.result_max, out.scratch, out.update_scratch));
+    }
     if full(2) && !inputs.is_null() && !info.is_null() {
         // SAFETY: the title's own structures, filled by the call.
         let (i, out) = unsafe { (&*inputs, &*info) };
